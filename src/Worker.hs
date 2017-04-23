@@ -115,6 +115,7 @@ talk server@Server{..} h = do
 -- Run the local client
 runClient :: Server -> LocalClient -> IO ()
 runClient serv@Server{..} client@LocalClient{..} = do
+    putStrLn "[debug] runClient"
     _ <- race server receive
     return ()
   where server = join $ atomically $ do
@@ -418,7 +419,9 @@ checkAddClient server@Server{..} client = do
 
 --
 disconnectLocalClient :: Server -> CName -> IO ()
-disconnectLocalClient = undefined
+disconnectLocalClient server@Server{..} name = atomically $ do
+     deleteClient server name
+     sendRemoteAll server (MsgClientDisconnected name spid)
 
 -- 
 handleMonitorNotification :: Server -> ProcessMonitorNotification -> Process ()
