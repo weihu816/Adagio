@@ -1,112 +1,32 @@
 {-# OPTIONS -Wall -fwarn-tabs -fno-warn-type-defaults  #-}
 {-# LANGUAGE TemplateHaskell, DeriveDataTypeable, DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Worker where
 
 import Control.Distributed.Process
   hiding (Message, mask, finally, handleMessage, proxy)
 import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Backend.SimpleLocalnet
-import Control.Distributed.Process.Node as Node hiding (newLocalNode)
 import Control.Concurrent.Async
 import Control.Monad
 import Control.Concurrent.STM
 import Control.Concurrent
 import Text.Printf
-import GHC.Generics (Generic)
 import Network
 import System.IO
-import Data.Binary
-import Data.Typeable
 import qualified Data.Map as Map
 import Data.Map (Map)
 import qualified Data.List as List
 import qualified Data.UUID as U       -- UUID
 import qualified Data.UUID.V4 as U4   -- UUID
 import Control.Exception
-import System.Environment -- getArgs
--- import ConcurrentUtils
--- import Control.Monad.IO.Class
--- import qualified Data.Foldable  as F
-
--- Client
-type CName = String
-type ID = String
-data Client = ClientLocal LocalClient | ClientRemote RemoteClient
-
--- RemoteClient
-data RemoteClient = RemoteClient {
-      remoteName :: CName,
-      clientHome :: ProcessId
-    }
-
--- LocalClient
-data LocalClient = LocalClient {
-        localName      :: CName,
-        clientHandle   :: Handle,
-        clientKicked   :: TVar (Maybe String),
-        clientSendChan :: TChan Message
-    }
-
--- Extract client name
-clientName :: Client -> CName
-clientName (ClientLocal  c) = localName c
-clientName (ClientRemote c) = remoteName c
-
--- Create a new local client
-newLocalClient :: CName -> Handle -> STM LocalClient
-newLocalClient name h = do
-  c <- newTChan
-  k <- newTVar Nothing
-  return LocalClient {
-      localName      = name,
-      clientHandle   = h,
-      clientSendChan = c,
-      clientKicked   = k
-    }
-
--- Server
-data Server = Server {
-    clients   :: TVar (Map String Client),
-    proxychan :: TChan (Process ()),        -- sendRemote
-    servers   :: TVar [ProcessId],
-    spid      :: ProcessId,
-    counter   :: TVar (Int, Int), -- largest sequence number proposed and observed
-    votes     :: TVar (Map ID (Int, Int)),  -- Sender: uuid => (remain count, max)
-    messages  :: TVar (Map ID (Bool, Int, ProcessId, String, CName)), -- Receiver: uuid => (flag, pval, pid, msg)
-    mmdb      :: TVar (Map Key Value)
-  }
-
--- Message
-data Message = Notice String
-             | Tell CName String
-             | Broadcast CName String
-             | Command String
-  deriving (Typeable, Generic)
-instance Binary Message
-
-type Key   = String
-type Value = String
-
--- PMessage
-data PMessage
-  = MsgServerInfo         Bool ProcessId [CName]
-  | MsgSend               CName Message
-  | MsgBroadcast          Message
-  | MsgKick               CName CName
-  | MsgNewClient          CName ProcessId
-  | MsgClientDisconnected CName ProcessId
-  | MulticastRequest      ProcessId String ID CName
-  | MulticastPropose      ProcessId Int ID -- pid propose uuid
-  | MulticastDeciscion    ProcessId Int ID -- pid propose uuid
-  | SetRequest            Key Value
-  | GetRequest            Key ProcessId
-  | GetResponse           Key (Maybe Value)
-  deriving (Typeable, Generic)
-instance Binary PMessage
-
+import Data.Char
+import KVStore
 
 -- Every node will be equal (master)
-master :: Backend -> String -> Int -> Int -> Process ()
+master :: Backend -> String -> String -> String -> Process ()
 master backend port ring_size ring_id = do
     mynode <- getSelfNode
     -- Peer discovery
@@ -120,13 +40,13 @@ master backend port ring_size ring_id = do
     forM_ peers $ \peer -> do
       whereisRemoteAsync peer "dNode"
     -- Start!
-    dNode (read port :: Int)
+    dNode (read port :: Int) (read ring_size :: Int) (read ring_id :: Int)
 
 
 -- Start a new distributed server
-dNode :: Int -> Process ()
-dNode port = do
-    server@Server{..} <- newNode []     -- create a new server instance
+dNode :: Int -> Int -> Int -> Process ()
+dNode port rsize rid = do
+    server@Server{..} <- newNode [] rsize rid  -- create a new server instance
     _ <- ($) liftIO $ forkIO (socketListener server port)
     _ <- spawnLocal $ forever $ join $ liftIO $ atomically $ readTChan proxychan -- proxy
     forever $
@@ -141,8 +61,8 @@ dNode port = do
 --------------------------------------------------------------------------------
 
 -- Create a new server
-newNode :: [ProcessId] -> Process Server
-newNode pids = do
+newNode :: [ProcessId] -> Int -> Int -> Process Server
+newNode pids rsize rid = do
   pid <- getSelfPid
   liftIO $ do
     s <- newTVarIO pids
@@ -151,8 +71,12 @@ newNode pids = do
     v <- newTVarIO Map.empty
     m <- newTVarIO Map.empty
     o <- newTChanIO
+    p <- newTVarIO [(rid, pid)]
+    f <- newTVarIO $ Map.fromList $ map (\t -> (t, (rid, pid)))
+         [0 .. floor (logBase 2.0 (fromIntegral rsize)) - 1]
     d <- newTVarIO Map.empty
     return Server { clients = c, servers = s, proxychan = o, spid = pid,
+                    peers = p, ftable = f, ringSize = rsize, ringId = rid,
                     counter = x, votes = v, messages = m, mmdb = d }
 
 --------------------------------------------------------------------------------
@@ -199,7 +123,7 @@ runClient serv@Server{..} client@LocalClient{..} = do
             Nothing -> do
               msg <- readTChan clientSendChan
               return $ do continue <- handleMessage serv client msg
-                          when continue $ server
+                          when continue server
             Just reason -> return $
               hPutStrLn clientHandle $ "You have been kicked: " ++ reason
         receive = forever $ do msg <- hGetLine clientHandle
@@ -215,7 +139,7 @@ runClient serv@Server{..} client@LocalClient{..} = do
 
 -- Send PMessage to the local node
 sendLocal :: LocalClient -> Message -> STM ()
-sendLocal LocalClient{..} msg = writeTChan clientSendChan msg
+sendLocal LocalClient{..} = writeTChan clientSendChan
 
 -- Send PMessage to a remote node
 sendRemote :: Server -> ProcessId -> PMessage -> STM ()
@@ -246,13 +170,23 @@ kick :: Server -> CName -> CName -> STM ()
 kick = undefined
 
 tell :: Server -> LocalClient -> CName -> String -> IO ()
-tell = undefined
+tell server@Server{..} LocalClient{..} who msg = do
+  ok <- atomically $ sendToName server who (Tell localName msg)
+  if ok then return ()
+  else hPutStrLn clientHandle (who ++ " is not connected.")
 
 sendToName :: Server -> CName -> Message -> STM Bool
-sendToName = undefined
+sendToName server@Server{..} name msg = do
+    clientmap <- readTVar clients
+    case Map.lookup name clientmap of
+        Nothing     -> return False
+        Just client -> sendMessage server client msg >> return True
 
 sendMessage :: Server -> Client -> Message -> STM ()
-sendMessage = undefined
+sendMessage _ (ClientLocal client) msg =
+    sendLocal client msg
+sendMessage server (ClientRemote client) msg =
+    sendRemote server (clientHome client) (MsgSend (remoteName client) msg)
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -348,16 +282,35 @@ multicast_deliver server@Server{..} msg uuid cname = do
 --
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
-dbstore_get :: Server -> Key -> Value -> STM()
-dbstore_get Server{..} k v = do
+db_get :: Server -> LocalClient -> Key -> STM()
+db_get server@Server{..} LocalClient{..} k = do
+  pids <- readTVar servers
+  let pmsg = GetRequest k localName
+  let allpids = List.sort (spid : pids)
+  let db_pid = allpids !! (ord (head k) `mod` (length allpids))
+  sendRemote server db_pid pmsg
+
+db_set :: Server -> LocalClient -> Key -> Value -> STM()
+db_set server@Server{..} LocalClient{..} k v = do
+  pids <- readTVar servers
+  let pmsg = SetRequest k v localName
+  let allpids = List.sort (spid : pids)
+  let db_pid = allpids !! (ord (head k) `mod` (length allpids))
+  sendRemote server db_pid pmsg
+
+dbstore_get :: Server -> Key -> CName -> STM()
+dbstore_get server@Server{..} k name = do
+  db <- readTVar mmdb
+  let msg = case Map.lookup k db of
+              Just v  -> DB $ "get() succeeds: " ++ k ++ " = " ++ v
+              Nothing -> DB $ "get() failed: No such key: " ++ k
+  void $ sendToName server name msg
+
+dbstore_set :: Server -> Key -> Value -> CName -> STM ()
+dbstore_set server@Server{..} k v name = do
   db <- readTVar mmdb
   writeTVar mmdb $ Map.insert k v db
-
-dbstore_set :: Server -> Key -> ProcessId -> STM()
-dbstore_set server@Server{..} k pid = do
-  db <- readTVar mmdb
-  sendRemote server pid (GetResponse k (Map.lookup k db))
-  -- sendChan port (Map.lookup k store)
+  void $ sendToName server name $ DB ("set() succeeds: " ++ k ++ " = " ++ v)
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -371,6 +324,7 @@ dbstore_set server@Server{..} k pid = do
 handleMessage :: Server -> LocalClient -> Message -> IO Bool
 handleMessage server@Server{..} client@LocalClient{..} message =
   case message of
+    DB msg -> output msg
     Notice msg         -> output $ "*** " ++ msg
     Tell name msg      -> output $ "*" ++ name ++ "*: " ++ msg
     Broadcast name msg -> output $ "<" ++ name ++ ">: " ++ msg
@@ -387,6 +341,12 @@ handleMessage server@Server{..} client@LocalClient{..} message =
         "/broadcast" : what -> do
             atomically $ broadcast server $ Broadcast localName (unwords what)
             return True
+        "/get" : key -> do
+            atomically $ db_get server client (unwords key)
+            return True
+        "/set" : key : value -> do
+            atomically $ db_set server client key (unwords value)
+            return True
         ('/':_):_ -> do
             hPutStrLn clientHandle $ "Unrecognised command: " ++ msg
             return True
@@ -400,9 +360,9 @@ handleMessage server@Server{..} client@LocalClient{..} message =
 handleRemoteMessage :: Server -> PMessage -> Process ()
 handleRemoteMessage server@Server{..} m =
   case m of
-    MsgServerInfo rsvp pid cs -> newServerInfo server rsvp pid cs
+    MsgServerInfo rsvp rid pid cs -> newServerInfo server rsvp rid pid cs
     MsgBroadcast msg -> liftIO $ atomically $ broadcastLocal server msg
-    MsgSend _ _ -> undefined
+    MsgSend name msg -> liftIO $ atomically $ void $ sendToName server name msg
     MsgKick _ _   -> undefined
     MsgNewClient name pid -> liftIO $ atomically $ do
         ok <- checkAddClient server (ClientRemote (RemoteClient name pid))
@@ -415,18 +375,18 @@ handleRemoteMessage server@Server{..} m =
               deleteClient server name
             Just _ -> return ()
     -- Receive a request, need to queue the msg and propose a number
-    MulticastRequest pid msg uuid cname -> liftIO $ atomically $ do
+    MulticastRequest pid msg uuid cname -> liftIO $ atomically $
       multicast_propose server pid uuid msg cname
     -- Send receive propose, need to identify which msg corresponds to it
-    MulticastPropose _ pval uuid -> liftIO $ atomically $ do
+    MulticastPropose _ pval uuid -> liftIO $ atomically $
       multicast_accept server pval uuid
     -- Receive the final decision for a message ordering
-    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ atomically $ do
+    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ atomically $
       multicast_agree server sender_pid timestamp uuid
     -- Receive a set request
-    SetRequest k v -> liftIO $ atomically $ do dbstore_get server k v
+    SetRequest k v cn -> liftIO $ atomically $ dbstore_set server k v cn
     -- REceive a get reqeust
-    GetRequest k pid -> liftIO $ atomically $ do dbstore_set server k pid
+    GetRequest k cn -> liftIO $ atomically $ dbstore_get server k cn
     GetResponse _ _ -> undefined
 
 -- Handle the join request by sending my self server information
@@ -436,7 +396,7 @@ handleWhereIsReply server@Server{..} (WhereIsReply _ (Just pid)) =
   liftIO $ atomically $ do
     clientmap <- readTVar clients
     sendRemote server pid
-      (MsgServerInfo True spid [ localName c | ClientLocal c <- Map.elems clientmap ])
+      (MsgServerInfo True ringId spid [ localName c | ClientLocal c <- Map.elems clientmap ])
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -465,7 +425,7 @@ handleMonitorNotification :: Server -> ProcessMonitorNotification -> Process ()
 handleMonitorNotification server@Server{..} (ProcessMonitorNotification _ pid _) = do
   say (printf "server on %s has died" (show pid))
   liftIO $ atomically $ do
-    old_pids <- readTVar servers
+    old_pids <- readTVar servers -- TODO
     writeTVar servers (filter (/= pid) old_pids)
     clientmap <- readTVar clients
     let
@@ -475,12 +435,20 @@ handleMonitorNotification server@Server{..} (ProcessMonitorNotification _ pid _)
     writeTVar clients (Map.filter (not . now_disconnected) clientmap)
     mapM_ (deleteClient server) (Map.keys disconnected_clients)
 
-newServerInfo :: Server -> Bool -> ProcessId -> [CName] -> Process ()
-newServerInfo server@Server{..} rsvp pid remote_clients = do
-  liftIO $ printf "%s received server info from %s\n" (show spid) (show pid)
+--
+newServerInfo :: Server -> Bool -> RId -> ProcessId -> [CName] -> Process ()
+newServerInfo server@Server{..} rsvp rid pid remote_clients = do
+  liftIO $ printf "%s received server info from %s [ring: %d]\n" (show spid) (show pid) rid
   join $ liftIO $ atomically $ do
     old_pids <- readTVar servers
     writeTVar servers (pid : filter (/= pid) old_pids)
+    -- TODO: update peer list
+    -- old_peers <- readTVar peers
+    -- let new_peers = ((rid, pid) : filter (/= (rid, pid)) old_peers)
+    -- writeTVar peers new_peers
+    -- TODO: update chord finger table
+    -- old_ftable <- readTVar ftable
+    -- writeTVar ftable $ update_ftable new_peers old_ftable ring_id
     clientmap <- readTVar clients
     let new_clientmap = Map.union clientmap $ Map.fromList
                [ (n, ClientRemote (RemoteClient n pid)) | n <- remote_clients ]
@@ -489,9 +457,22 @@ newServerInfo server@Server{..} rsvp pid remote_clients = do
     writeTVar clients new_clientmap
     when rsvp $ do
       sendRemote server pid
-         (MsgServerInfo False spid [ localName c | ClientLocal c <- Map.elems new_clientmap ])
+         (MsgServerInfo False ringId spid [ localName c | ClientLocal c <- Map.elems new_clientmap ])
     -- monitor the new server
     return (when (pid `notElem` old_pids) $ void $ monitor pid)
+
+
+updateFtable :: [(RId, ProcessId)] -> Map RId (RId, ProcessId) -> RId -> Map RId (RId, ProcessId)
+updateFtable = undefined
+
+--
+-- Sort the message buffer (process id is used to break the tie)
+-- sortMessage :: (ID, (Bool, Int, ProcessId, String, CName)) ->
+--                (ID, (Bool, Int, ProcessId, String, CName)) -> Ordering
+-- sortMessage (_, (_, a, b, _, _)) (_, (_, c, d, _, _))
+--   | a < c = LT
+--   | a > c = GT
+--   | otherwise = if b < d then LT else GT
 
 deleteClient :: Server -> CName -> STM ()
 deleteClient server@Server{..} name = do
@@ -502,28 +483,9 @@ genUUID :: IO String
 genUUID = do
     x <- U4.nextRandom
     return $ U.toString x
---------------------------------------------------------------------------------
---------------------------------------------------------------------------------
---
---                           >> Main Entrance <<
---
---------------------------------------------------------------------------------
---------------------------------------------------------------------------------
 
 -- register remotable (using distributed-process framework)
 remotable ['dNode]
 
--- Main entrance (using distributed-process framework)
-main :: IO()
-main = do
- [port, d_port, ring_size, ring_id] <- getArgs
- backend <- initializeBackend "localhost" port
-                              (Main.__remoteTable initRemoteTable)
- node <- newLocalNode backend
- Node.runProcess node (master backend d_port ring_size ring_id)
-
-
-
-
-
-
+rcdata :: RemoteTable -> RemoteTable
+rcdata = Worker.__remoteTable

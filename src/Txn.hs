@@ -16,10 +16,6 @@ module KVProtocol
   , KVTxnId
   , KVTime
   , kV_TIMEOUT_MICRO
-  , getMessage
-  , sendMessage
-  , connectToHost
-  , listenOnPort
   ) where
 
 import Data.Serialize as CEREAL
@@ -33,49 +29,43 @@ import Network as NETWORK
 import Network.Socket as SOCKET
 import Network.Socket.ByteString as SOCKETBSTRING
 import Network.BSD as BSD
-
 import GHC.Generics (Generic)
-
 import Data.Time.Clock
-
 import Network
 import System.IO as IO
-import Rainbow as Rainbow
 
-import qualified Lib
 
 type KVKey = String
 type KVVal = String
-type KVTime = Integer
-
 type KVTxnId = (Int, Int) -- (client_id, txn_id)
-
+type KVTime = Integer
 
 -- TODO, with more clients, need txn_id to be (txn_id, client_id) tuples
 
-data KVRequest
-    = GetRequest      KVTime KVKey           -- issue time, key
-    | SetRequest      KVTime KVKey KVVal  -- issue time, key, value
-    | DeleteRequest   KVTime KVKey         -- issue time, key     
+data KVRequest 
+    = GetReq { issuedUTC :: KVTime , reqkey :: KVKey }
+    | PutReq { issuedUTC :: KVTime , putkey :: KVKey , putval :: KVVal }
+    | DelReq { issuedUTC :: KVTime, delkey :: KVKey }
     deriving (Generic, Show)
-instance Binary KVRequest
 
-data KVResponse = KVSuccess KVKey Maybe KVVal | KVFailure String  -- error message
+data KVResponse
+    = KVSuccess { key :: KVKey, val :: Maybe KVVal}
+    | KVFailure { errorMsg :: String }
     deriving (Generic, Show)
-instance Binary KVResponse
 
 data KVDecision = DecisionCommit | DecisionAbort
     deriving (Generic, Show, Eq)
-instance Binary KVDecision
 
-data KVVote = VoteReady| VoteAbort
+data KVVote = VoteReady | VoteAbort
     deriving (Generic, Show, Eq)
-instance Binary KVVote
 
-data KVMessage
-    = KVRegistration    KVTxnId, HostName, Int-- txnid, hostname, portid
-    | KVResponse        KVTxnId, Int, KVResponse -- txn_id, worker_id, response
-    | KVRequest {  -- PREPARE
+data KVMessage = KVRegistration { txn_id :: KVTxnId , pid :: ProcessId }
+                | KVResponse {
+                  txn_id   :: KVTxnId
+                , worker_id :: Int
+                , response :: KVResponse
+                }
+               | KVRequest {  -- PREPARE
                   txn_id   :: KVTxnId
                 , request :: KVRequest
                 }
@@ -87,7 +77,7 @@ data KVMessage
                | KVAck {
                   txn_id   :: KVTxnId --final message, sent by worker
                 , ack_id   :: Maybe Int --either the workerId (if sent FROM worker), or Nothing
-                , success  :: Maybe B.ByteString
+                , success  :: Maybe String
                }
                | KVVote {
                   txn_id   :: KVTxnId -- READY or ABORT, sent by worker
@@ -96,4 +86,14 @@ data KVMessage
                 , request  :: KVRequest
                }        
   deriving (Generic, Show)
+
+instance Binary KVRequest
+instance Binary KVMessage
+instance Binary KVResponse
+instance Binary KVDecision
+instance Binary KVVote
+
+--MICROSECONDS
+kV_TIMEOUT_MICRO :: KVTime
+kV_TIMEOUT_MICRO = 1000000
 

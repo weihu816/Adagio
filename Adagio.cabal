@@ -15,13 +15,25 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib
+  exposed-modules:     Lib, KVStore, Worker
   build-depends:       base >= 4.7 && < 5
+                       , stm == 2.4.*
+                       , containers
+                       , network
+                       , network-uri
+                       , async == 2.*
+                       , binary >=0.6.3 && <= 0.9
+                       , template-haskell
+                       , transformers
+                       , distributed-process == 0.6.*
+                       , distributed-process-simplelocalnet == 0.2.*
+                       , distributed-static >= 0.2 && < 0.4
+                       , uuid
   default-language:    Haskell2010
 
-executable Adagio
+executable node
   hs-source-dirs:      app
-  main-is:             Main.hs
+  main-is:             Node.hs
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base
                      , Adagio
@@ -36,7 +48,26 @@ executable Adagio
                      , distributed-process == 0.6.*
                      , distributed-process-simplelocalnet == 0.2.*
                      , distributed-static >= 0.2 && < 0.4
-                     , uuid
+  default-language:    Haskell2010
+
+executable appserver
+  hs-source-dirs:      app
+  main-is:             AppServer.hs
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  build-depends:       base
+                     , Adagio
+                     , stm == 2.4.*
+                     , containers
+                     , network
+                     , network-uri
+                     , async == 2.*
+                     , binary >=0.6.3 && <= 0.9
+                     , template-haskell
+                     , transformers
+                     , distributed-process == 0.6.*
+                     , distributed-process-simplelocalnet == 0.2.*
+                     , distributed-static >= 0.2 && < 0.4
+                     , network-transport-tcp
   default-language:    Haskell2010
 
 test-suite Adagio-test
