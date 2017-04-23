@@ -70,6 +70,24 @@ executable appserver
                      , network-transport-tcp
   default-language:    Haskell2010
 
+executable clientui
+  hs-source-dirs:      app
+  main-is:             ClientUI.hs
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  build-depends:       base
+                     , Adagio
+                     , brick
+                     , lens
+                     , socket
+                     , microlens
+                     , microlens-th
+                     , vty
+                     , text-zipper
+                     , bytestring
+                     , time
+                     , split
+  default-language:    Haskell2010
+
 test-suite Adagio-test
   type:                exitcode-stdio-1.0
   hs-source-dirs:      test
