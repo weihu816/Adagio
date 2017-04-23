@@ -72,7 +72,8 @@ data Server = Server {
     spid      :: ProcessId,
     counter   :: TVar (Int, Int), -- largest sequence number proposed and observed
     votes     :: TVar (Map ID (Int, Int)),  -- Sender: uuid => (remain count, max)
-    messages  :: TVar (Map ID (Bool, Int, ProcessId, String, CName)) -- Receiver: uuid => (flag, pval, pid, msg)
+    messages  :: TVar (Map ID (Bool, Int, ProcessId, String, CName)), -- Receiver: uuid => (flag, pval, pid, msg)
+    mmdb      :: TVar (Map Key Value)
   }
 
 -- Message
@@ -82,6 +83,9 @@ data Message = Notice String
              | Command String
   deriving (Typeable, Generic)
 instance Binary Message
+
+type Key   = String
+type Value = String
 
 -- PMessage
 data PMessage
@@ -94,13 +98,16 @@ data PMessage
   | MulticastRequest      ProcessId String ID CName
   | MulticastPropose      ProcessId Int ID -- pid propose uuid
   | MulticastDeciscion    ProcessId Int ID -- pid propose uuid
+  | SetRequest            Key Value
+  | GetRequest            Key ProcessId
+  | GetResponse           Key (Maybe Value)
   deriving (Typeable, Generic)
 instance Binary PMessage
 
 
 -- Every node will be equal (master)
-master :: Backend -> String -> Process ()
-master backend port = do
+master :: Backend -> String -> Int -> Int -> Process ()
+master backend port ring_size ring_id = do
     mynode <- getSelfNode
     -- Peer discovery
     peers0 <- liftIO $ findPeers backend 1000000
@@ -144,8 +151,9 @@ newNode pids = do
     v <- newTVarIO Map.empty
     m <- newTVarIO Map.empty
     o <- newTChanIO
+    d <- newTVarIO Map.empty
     return Server { clients = c, servers = s, proxychan = o, spid = pid,
-                    counter = x, votes = v, messages = m }
+                    counter = x, votes = v, messages = m, mmdb = d }
 
 --------------------------------------------------------------------------------
 
@@ -333,7 +341,24 @@ multicast_deliver server@Server{..} msg uuid cname = do
   writeTVar messages $ Map.delete uuid messageMap
   broadcastLocal server (Broadcast cname msg)
 
--- TODO; Sync, Test, GUI
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+--
+--                          >> MESSAGE Handling <<
+--
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+dbstore_get :: Server -> Key -> Value -> STM()
+dbstore_get Server{..} k v = do
+  db <- readTVar mmdb
+  writeTVar mmdb $ Map.insert k v db
+
+dbstore_set :: Server -> Key -> ProcessId -> STM()
+dbstore_set server@Server{..} k pid = do
+  db <- readTVar mmdb
+  sendRemote server pid (GetResponse k (Map.lookup k db))
+  -- sendChan port (Map.lookup k store)
+
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 --
@@ -390,14 +415,19 @@ handleRemoteMessage server@Server{..} m =
               deleteClient server name
             Just _ -> return ()
     -- Receive a request, need to queue the msg and propose a number
-    MulticastRequest pid msg uuid cname -> liftIO $ do
-      atomically $ multicast_propose server pid uuid msg cname
+    MulticastRequest pid msg uuid cname -> liftIO $ atomically $ do
+      multicast_propose server pid uuid msg cname
     -- Send receive propose, need to identify which msg corresponds to it
-    MulticastPropose _ pval uuid -> liftIO $ do
-      atomically $ multicast_accept server pval uuid
+    MulticastPropose _ pval uuid -> liftIO $ atomically $ do
+      multicast_accept server pval uuid
     -- Receive the final decision for a message ordering
-    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ do
-      atomically $ multicast_agree server sender_pid timestamp uuid
+    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ atomically $ do
+      multicast_agree server sender_pid timestamp uuid
+    -- Receive a set request
+    SetRequest k v -> liftIO $ atomically $ do dbstore_get server k v
+    -- REceive a get reqeust
+    GetRequest k pid -> liftIO $ atomically $ do dbstore_set server k pid
+    GetResponse _ _ -> undefined
 
 -- Handle the join request by sending my self server information
 handleWhereIsReply :: Server -> WhereIsReply -> Process ()
@@ -451,19 +481,15 @@ newServerInfo server@Server{..} rsvp pid remote_clients = do
   join $ liftIO $ atomically $ do
     old_pids <- readTVar servers
     writeTVar servers (pid : filter (/= pid) old_pids)
-
     clientmap <- readTVar clients
-
     let new_clientmap = Map.union clientmap $ Map.fromList
                [ (n, ClientRemote (RemoteClient n pid)) | n <- remote_clients ]
             -- ToDo: should remove other remote clients with this pid
             -- ToDo: also deal with conflicts
     writeTVar clients new_clientmap
-
     when rsvp $ do
       sendRemote server pid
          (MsgServerInfo False spid [ localName c | ClientLocal c <- Map.elems new_clientmap ])
-
     -- monitor the new server
     return (when (pid `notElem` old_pids) $ void $ monitor pid)
 
@@ -490,11 +516,11 @@ remotable ['dNode]
 -- Main entrance (using distributed-process framework)
 main :: IO()
 main = do
- [port, chat_port] <- getArgs
+ [port, d_port, ring_size, ring_id] <- getArgs
  backend <- initializeBackend "localhost" port
                               (Main.__remoteTable initRemoteTable)
  node <- newLocalNode backend
- Node.runProcess node (master backend chat_port)
+ Node.runProcess node (master backend d_port ring_size ring_id)
 
 
 
