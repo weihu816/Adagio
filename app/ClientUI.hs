@@ -39,6 +39,11 @@ import Brick.Widgets.Core
   , vBox
   , viewport
   , str
+  , clickable
+  , withDefAttr
+  , padLeftRight
+  , padTopBottom
+  , padBottom
   )
 import Brick.Util (on)
 import Brick.BChan
@@ -52,12 +57,14 @@ import System.Environment
 data CustomEvent = Recv String
                  deriving Show
 
-data Name = Edit1 
-          | VP1 
+data Name = VP1
+          | Edit1
+          | Button1
           deriving (Ord, Show, Eq)
 
 data St =
-    St { _focusRing :: F.FocusRing Name
+    St { _clicked :: [T.Extent Name]
+       , _focusRing :: F.FocusRing Name
        , _edit1 :: E.Editor String Name
        , _sock :: Socket Inet Stream TCP
        , _serverAddr :: InetAddress
@@ -65,35 +72,50 @@ data St =
        , _clockIO :: IO String
        , _messageList :: [String]
        , _content :: String
-       , _viewportWidth :: Int}
+       , _viewportWidth :: Int
+       , _lastClick :: Maybe (Name, T.Location)}
 
 makeLenses ''St
 
 drawUI :: St -> [T.Widget Name]
 drawUI st = [ui]
     where
-        e1 = F.withFocusRing (st^.focusRing) E.renderEditor (st^.edit1)
-
-        ui = C.center $ B.border $ -- hLimit 60 $ vLimit 21 $
-             vBox [ scrollArea, vLimit 10 $ e1]
-
         scrollArea = viewport VP1 Vertical $
                        vBox $ (str <$> st^.messageList)
+
+        e1 = F.withFocusRing (st^.focusRing) E.renderEditor (st^.edit1)
+
+        b1 = let wasClicked = (fst <$> st^.lastClick) == Just Button1
+             in clickable Button1 $
+               withDefAttr "send_button" $
+               B.border $
+               padTopBottom 1 $
+               padLeftRight (if wasClicked then 2 else 3) $
+               str (if wasClicked then "<" <> "Send" <> ">" else "Send")
+
+        ui = C.center $ B.border $ -- hLimit 60 $ vLimit 21 $
+             vBox [ scrollArea, B.hBorder, hBox [(vLimit 9 $ e1) <+> 
+                                                 (padLeftRight 1 $ padTopBottom 2 $ vLimit 5 $ 
+                                                  hLimit 20 $ C.vCenter $ b1)]
+                  ]
 
 vp1Scroll :: M.ViewportScroll Name
 vp1Scroll = M.viewportScroll VP1
 
 appEvent :: St -> T.BrickEvent Name CustomEvent -> T.EventM Name (T.Next St)
+appEvent st (T.MouseDown n _ _ loc)     = processButton st n loc
+appEvent st (T.MouseUp _ _ _)           = M.continue $ st & lastClick .~ Nothing
+appEvent st (T.VtyEvent (V.EvMouseUp _ _ _))  = M.continue $ st & lastClick .~ Nothing
 appEvent st (T.VtyEvent (V.EvKey V.KDown [])) = M.vScrollBy vp1Scroll 1 >> M.continue st
 appEvent st (T.VtyEvent (V.EvKey V.KUp []))   = M.vScrollBy vp1Scroll (-1) >> M.continue st
-appEvent st (T.AppEvent (Recv msg))           = processViewport st msg                              
 appEvent st (T.VtyEvent ev)                   =
     case ev of
         V.EvKey V.KEsc []        -> M.halt st
         V.EvKey V.KEnter []      -> processEditor st
         _                        -> M.continue =<< case F.focusGetCurrent (st^.focusRing) of
                                                      Just Edit1 -> T.handleEventLensed st edit1 E.handleEditorEvent ev
-                                                     Nothing -> return st
+                                                     Nothing    -> return st
+appEvent st (T.AppEvent (Recv msg))           = processViewport st msg
 appEvent st _                                 = M.continue st
 
 getLineNumber :: String -> Int -> Int
@@ -110,16 +132,33 @@ breakStringIntoLines str n =
 
 processViewport :: St -> String -> T.EventM Name (T.Next St)
 processViewport st msg = do
-  liftIO (getTimeStringIO) >>= \timeStr -> M.vScrollBy vp1Scroll (getLineNumber msg 80) >> (M.continue $ 
-                              st & clockIO .~ getTimeStringIO
-                                 & messageList %~ (++ [timeStr ++ "\n" ++ 
-                                                  (breakStringIntoLines msg 80) ++ "\n"]))
+  liftIO (getTimeStringIO) >>= \timeStr -> M.vScrollBy vp1Scroll (getLineNumber msg 80) >> 
+                                 (M.continue $ st & clockIO .~ getTimeStringIO
+                                                  & messageList %~ (++ [timeStr ++ "\n" ++ 
+                                                    (breakStringIntoLines msg 80) ++ "\n"]))
+
+processButton :: St -> Name -> T.Location -> T.EventM Name (T.Next St)
+processButton st n loc = 
+  case n of 
+    Button1 -> do
+                 let buffer = unlines (E.getEditContents $ st^.edit1)
+                 if length buffer > 0 then
+                   liftIO (do sendMsgToServer buffer st) >> 
+                     (M.continue $ st & lastClick .~ Just (n, loc)
+                                    & edit1 %~ E.applyEdit killToBOL
+                                    & content .~ buffer)
+                 else 
+                   M.continue $ st & lastClick .~ Just (n, loc)
+    _       -> M.continue st
 
 processEditor :: St -> T.EventM Name (T.Next St)
 processEditor st = do
   let buffer = unlines (E.getEditContents $ st^.edit1)
-  liftIO (do sendMsgToServer buffer st) >>
-    (M.continue $ st & edit1 %~ E.applyEdit killToBOL & content .~ buffer)
+  if length buffer > 0 then 
+    liftIO (do sendMsgToServer buffer st) >>
+      (M.continue $ st & edit1 %~ E.applyEdit killToBOL & content .~ buffer)
+  else 
+    M.continue st
 
 sendMsgToServer :: String -> St -> IO St
 sendMsgToServer msg st = do 
@@ -130,7 +169,8 @@ sendMsgToServer msg st = do
 
 initialState :: (Socket Inet Stream TCP) -> InetAddress -> InetPort -> St
 initialState sock addr port =
-    St (F.focusRing [Edit1])
+    St ([])
+       (F.focusRing [Edit1])
        (E.editor Edit1 (str . unlines) Nothing "")
        (sock)
        (addr)
@@ -139,6 +179,7 @@ initialState sock addr port =
        ([])
        ("")
        (0)
+       (Nothing)
 
 getTimeStringIO :: IO String
 getTimeStringIO = do 
@@ -159,6 +200,7 @@ theMap :: A.AttrMap
 theMap = A.attrMap V.defAttr
     [ (E.editAttr,        V.white `on` V.blue)
     , (E.editFocusedAttr, V.black `on` V.cyan)
+    , ("send_button",     V.white `on` V.green)
     ]
 
 appCursor :: St -> [T.CursorLocation Name] -> Maybe (T.CursorLocation Name)
@@ -187,6 +229,10 @@ tupify4 [w, x, y, z] = (w, x, y, z)
 
 main :: IO ()
 main = do
+  let buildVty = do
+          v <- V.mkVty =<< V.standardIOConfig
+          V.setMode (V.outputIface v) V.Mouse True
+          return v
 
   [addr, port] <- getArgs
   let serverPort = fromInteger (read port :: Integer)
@@ -197,6 +243,6 @@ main = do
   forkIO $ forever $ 
     recvThread sock chan
 
-  finalState <- M.customMain (V.mkVty V.defaultConfig) (Just chan) theApp (initialState sock serverAddr serverPort)
+  finalState <- M.customMain buildVty (Just chan) theApp (initialState sock serverAddr serverPort)
 
   return ()
