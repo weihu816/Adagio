@@ -115,7 +115,6 @@ talk server@Server{..} h = do
 -- Run the local client
 runClient :: Server -> LocalClient -> IO ()
 runClient serv@Server{..} client@LocalClient{..} = do
-    putStrLn "[debug] runClient"
     _ <- race server receive
     return ()
   where server = join $ atomically $ do
@@ -202,11 +201,11 @@ multicast :: Server -> ID -> String -> CName -> STM ()
 multicast server@Server{..} msg uuid cname = do
   let pmsg = MulticastRequest spid msg uuid cname
   pids <- readTVar servers
-  let v = length pids    -- number of votes needed from remote nodes
+  let v = 1 + length pids    -- number of votes needed from remote nodes
   -- update vote map
   voteMap <- readTVar votes
   writeTVar votes $ Map.insert uuid (v, 0) voteMap
-  mapM_ (\pid -> sendRemote server pid pmsg) pids
+  mapM_ (\pid -> sendRemote server pid pmsg) (spid : pids)
 
 -- Receiver propose value to the Sender
 multicast_propose :: Server -> ProcessId -> ID -> String -> CName -> STM ()
@@ -227,7 +226,7 @@ multicast_accept server@Server{..} pval uuid = do -- update vote map
     Just (c, m)  -> do
       let new_c = c - 1             -- new counter for the remaining votes
       let new_max = max pval m      -- the largest proposed value
-      if new_c == 0 then do -- all responses are collected
+      if new_c == 0 then do         -- all responses are collected
         -- delete the entry
         writeTVar votes $ Map.delete uuid voteMap
         multicast_decision server uuid new_max
@@ -242,7 +241,7 @@ multicast_decision :: Server -> ID -> Int -> STM ()
 multicast_decision server@Server{..} uuid m = do
   let pmsg = MulticastDeciscion spid m uuid
   pids <- readTVar servers
-  mapM_ (\pid -> sendRemote server pid pmsg) pids
+  mapM_ (\pid -> sendRemote server pid pmsg) (spid : pids)
 
 -- Receiver receive a decision
 multicast_agree :: Server -> ProcessId -> Int -> ID -> STM()
@@ -353,6 +352,7 @@ handleMessage server@Server{..} client@LocalClient{..} message =
             return True
         _ -> do
           uuid <- genUUID
+          putStrLn $ "Initiate a multicast (totally ordering) request: " ++ msg
           atomically $ multicast server msg uuid localName
           return True
   where output s = do hPutStrLn clientHandle s; return True
@@ -376,14 +376,17 @@ handleRemoteMessage server@Server{..} m =
               deleteClient server name
             Just _ -> return ()
     -- Receive a request, need to queue the msg and propose a number
-    MulticastRequest pid msg uuid cname -> liftIO $ atomically $
-      multicast_propose server pid uuid msg cname
+    MulticastRequest pid msg uuid cname -> liftIO $ do
+      putStrLn (uuid ++ ": Receive MulticastRequest from " ++ show pid)
+      atomically $ multicast_propose server pid uuid msg cname
     -- Send receive propose, need to identify which msg corresponds to it
-    MulticastPropose _ pval uuid -> liftIO $ atomically $
-      multicast_accept server pval uuid
+    MulticastPropose _ pval uuid -> liftIO $ do
+      putStrLn (uuid ++ ": Receive MulticastPropose value " ++ show pval)
+      atomically $ do multicast_accept server pval uuid
     -- Receive the final decision for a message ordering
-    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ atomically $
-      multicast_agree server sender_pid timestamp uuid
+    MulticastDeciscion sender_pid timestamp uuid -> liftIO $ do
+      putStrLn (uuid ++ ": Receive MulticastDeciscion from " ++ show sender_pid)
+      atomically $ multicast_agree server sender_pid timestamp uuid
     -- Receive a set request
     SetRequest k v cn -> liftIO $ atomically $ dbstore_set server k v cn
     -- REceive a get reqeust
