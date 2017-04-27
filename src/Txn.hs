@@ -1,99 +1,95 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module KVProtocol
+module Txn
   (
-    KVRequest(..)
-  , KVResponse(..)
-  , KVMessage(..)
-  , KVVote(..)
-  , KVDecision(..)
-  , KVKey
-  , KVVal
-  , KVTxnId
-  , KVTime
-  , kV_TIMEOUT_MICRO
+    TxnManager(..),
+    beginTxn,
+    readTxn,
+    writeTxn,
+    commitTxn
   ) where
 
-import Data.Serialize as CEREAL
-import Data.ByteString.Lazy  as B
-import Data.ByteString.Char8 as C8
-import Debug.Trace
-import Control.Exception as E
-import Control.Concurrent
-import Control.Monad
-import Network as NETWORK
-import Network.Socket as SOCKET
-import Network.Socket.ByteString as SOCKETBSTRING
-import Network.BSD as BSD
-import GHC.Generics (Generic)
-import Data.Time.Clock
-import Network
-import System.IO as IO
-
+import qualified Data.Map as Map
+import Data.Map (Map)
+import Control.Concurrent.STM
+import Utils
+import qualified AppServer
 
 type KVKey = String
 type KVVal = String
-type KVTxnId = (Int, Int) -- (client_id, txn_id)
-type KVTime = Integer
+type KVVersion = Int
+type KVOldVersion = Int
 
--- TODO, with more clients, need txn_id to be (txn_id, client_id) tuples
+-- TxnManager
+data TxnManager = TxnManager {
+  txnId     :: String,
+  readSet   :: TVar (Map KVKey (KVKey, KVVal, KVVersion)),
+  writeSet  :: TVar (Map KVKey (KVKey, KVVal, KVOldVersion))
+}
 
-data KVRequest 
-    = GetReq { issuedUTC :: KVTime , reqkey :: KVKey }
-    | PutReq { issuedUTC :: KVTime , putkey :: KVKey , putval :: KVVal }
-    | DelReq { issuedUTC :: KVTime, delkey :: KVKey }
-    deriving (Generic, Show)
+beginTxn :: IO TxnManager
+beginTxn = do
+  r <- newTVarIO Map.empty
+  w <- newTVarIO Map.empty
+  tId <- genUUID
+  return TxnManager { txnId = tId, readSet = r, writeSet = w }
 
-data KVResponse
-    = KVSuccess { key :: KVKey, val :: Maybe KVVal}
-    | KVFailure { errorMsg :: String }
-    deriving (Generic, Show)
 
-data KVDecision = DecisionCommit | DecisionAbort
-    deriving (Generic, Show, Eq)
+readTxn :: TxnManager -> KVKey -> IO (Maybe KVVal)
+readTxn txn@TxnManager{..} key = do
+  r <- atomically $ do
+    rSet <- readTVar readSet
+    case Map.lookup key rSet of
+      Just (_, val, ver) ->
+        if ver == 0 then return Nothing else return (Just val)
+      _ -> return Nothing
+  case r of
+    Just _ -> return r
+    Nothing -> do
+      res <- AppServer.doRead key
+      case res of
+        Just (val, ver) -> do atomically $ updateRSet txn key val ver
+                              return (Just val)
+        _  -> return Nothing
 
-data KVVote = VoteReady | VoteAbort
-    deriving (Generic, Show, Eq)
 
-data KVMessage = KVRegistration { txn_id :: KVTxnId , pid :: ProcessId }
-                | KVResponse {
-                  txn_id   :: KVTxnId
-                , worker_id :: Int
-                , response :: KVResponse
-                }
-               | KVRequest {  -- PREPARE
-                  txn_id   :: KVTxnId
-                , request :: KVRequest
-                }
-               | KVDecision { -- COMMIT or ABORT, sent by master
-                  txn_id   :: KVTxnId
-                , decision :: KVDecision
-                , request  :: KVRequest
-                }
-               | KVAck {
-                  txn_id   :: KVTxnId --final message, sent by worker
-                , ack_id   :: Maybe Int --either the workerId (if sent FROM worker), or Nothing
-                , success  :: Maybe String
-               }
-               | KVVote {
-                  txn_id   :: KVTxnId -- READY or ABORT, sent by worker
-                , worker_id :: Int
-                , vote     :: KVVote
-                , request  :: KVRequest
-               }        
-  deriving (Generic, Show)
+writeTxn :: TxnManager -> KVKey -> KVVal -> IO ()
+writeTxn txn@TxnManager{..} key val = do
+  r <- atomically $ do rSet <- readTVar readSet; return (Map.lookup key rSet)
+  case r of
+    Just (_, _, ver) -> atomically $ updateRWSets txn key val ver
+    Nothing -> do
+      res <- AppServer.doRead key
+      case res of
+        Just (_, ver) -> atomically $ updateRWSets txn key val ver
+        _             -> atomically $ updateRWSets txn key val 0
 
-instance Binary KVRequest
-instance Binary KVMessage
-instance Binary KVResponse
-instance Binary KVDecision
-instance Binary KVVote
 
---MICROSECONDS
-kV_TIMEOUT_MICRO :: KVTime
-kV_TIMEOUT_MICRO = 1000000
+updateRSet :: TxnManager -> KVKey -> KVVal -> KVVersion -> STM ()
+updateRSet TxnManager{..} key val ver = do
+  rSet <- readTVar readSet
+  let new_rSet = Map.insert key (key, val, ver) rSet
+  writeTVar readSet new_rSet
+
+
+updateRWSets :: TxnManager -> KVKey -> KVVal -> KVVersion -> STM ()
+updateRWSets TxnManager{..} key val ver = do
+  rSet <- readTVar readSet
+  wSet <- readTVar writeSet
+  let new_rSet = Map.insert key (key, val, ver) rSet
+      new_wSet = Map.insert key (key, val, ver) wSet
+  writeTVar readSet new_rSet
+  writeTVar writeSet new_wSet
+
+
+commitTxn :: TxnManager -> IO Bool
+commitTxn txn@TxnManager{..} = do
+  wSet <- atomically $ readTVar writeSet
+  if (length wSet == 0) then return True
+  else AppServer.doCommit txnId (Map.elems wSet)
+
+
 

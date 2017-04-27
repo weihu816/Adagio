@@ -18,12 +18,12 @@ import Network
 import System.IO
 import qualified Data.Map as Map
 import Data.Map (Map)
+import Data.List.Split (splitOn)
 import qualified Data.List as List
-import qualified Data.UUID as U       -- UUID
-import qualified Data.UUID.V4 as U4   -- UUID
 import Control.Exception
 import Data.Char
 import KVStore
+import Utils
 
 -- Every node will be equal (master)
 master :: Backend -> String -> String -> String -> Process ()
@@ -37,8 +37,7 @@ master backend port ring_size ring_id = do
     -- Register my own server process
     register "dNode" mypid
     -- Send join request to the clster
-    forM_ peers $ \peer -> do
-      whereisRemoteAsync peer "dNode"
+    forM_ peers $ \peer -> whereisRemoteAsync peer "dNode"
     -- Start!
     dNode (read port :: Int) (read ring_size :: Int) (read ring_id :: Int)
 
@@ -86,10 +85,9 @@ socketListener :: Server -> Int -> IO ()
 socketListener server port = withSocketsDo $ do
   sock <- listenOn (PortNumber (fromIntegral port))
   printf "Listening on port %d\n" port
-  forever $ do
-      (h, addr, p) <- accept sock
-      printf "Accepted connection from %s: %s\n" addr (show p)
-      forkFinally (talk server h) (\_ -> hClose h)
+  forever $ do (h, addr, p) <- accept sock
+               printf "Accepted connection from %s: %s\n" addr (show p)
+               forkFinally (talk server h) (\_ -> hClose h)
 
 -- Read the client identifier (unique)
 talk :: Server -> Handle -> IO ()
@@ -172,8 +170,7 @@ kick = undefined
 tell :: Server -> LocalClient -> CName -> String -> IO ()
 tell server@Server{..} LocalClient{..} who msg = do
   ok <- atomically $ sendToName server who (Tell localName msg)
-  if ok then return ()
-  else hPutStrLn clientHandle (who ++ " is not connected.")
+  unless ok $ hPutStrLn clientHandle (who ++ " is not connected.")
 
 sendToName :: Server -> CName -> Message -> STM Bool
 sendToName server@Server{..} name msg = do
@@ -208,8 +205,8 @@ multicast server@Server{..} msg uuid cname = do
   mapM_ (\pid -> sendRemote server pid pmsg) (spid : pids)
 
 -- Receiver propose value to the Sender
-multicast_propose :: Server -> ProcessId -> ID -> String -> CName -> STM ()
-multicast_propose server@Server{..} pid uuid msg cname = do
+multicastPropose :: Server -> ProcessId -> ID -> String -> CName -> STM ()
+multicastPropose server@Server{..} pid uuid msg cname = do
   (p_val, a_val) <- readTVar counter
   let pval = 1 + max p_val a_val
   writeTVar counter (pval, a_val) -- update the largest number proposed
@@ -219,8 +216,8 @@ multicast_propose server@Server{..} pid uuid msg cname = do
   sendRemote server pid $ MulticastPropose spid pval uuid
 
 -- Proposer gets a propose response during the first request phase
-multicast_accept :: Server -> Int -> String -> STM ()
-multicast_accept server@Server{..} pval uuid = do -- update vote map
+multicastAccept :: Server -> Int -> String -> STM ()
+multicastAccept server@Server{..} pval uuid = do -- update vote map
   voteMap <- readTVar votes
   case Map.lookup uuid voteMap of
     Just (c, m)  -> do
@@ -229,23 +226,23 @@ multicast_accept server@Server{..} pval uuid = do -- update vote map
       if new_c == 0 then do         -- all responses are collected
         -- delete the entry
         writeTVar votes $ Map.delete uuid voteMap
-        multicast_decision server uuid new_max
+        multicastDecision server uuid new_max
       else do               -- still waiting for other responses
         (p_val, a_val) <- readTVar counter
         writeTVar counter (p_val, max new_max a_val)
         writeTVar votes $ Map.insert uuid (new_c, new_max) voteMap
-    _ -> error "Should not reach here" >> return ()
+    _ -> error "Should not reach here"
 
 -- Proposer makes the decision after collectioning all the responses
-multicast_decision :: Server -> ID -> Int -> STM ()
-multicast_decision server@Server{..} uuid m = do
+multicastDecision :: Server -> ID -> Int -> STM ()
+multicastDecision server@Server{..} uuid m = do
   let pmsg = MulticastDeciscion spid m uuid
   pids <- readTVar servers
   mapM_ (\pid -> sendRemote server pid pmsg) (spid : pids)
 
 -- Receiver receive a decision
-multicast_agree :: Server -> ProcessId -> Int -> ID -> STM()
-multicast_agree server@Server{..} _ m uuid = do
+multicastAgree :: Server -> ProcessId -> Int -> ID -> STM()
+multicastAgree server@Server{..} _ m uuid = do
   messageMap <- readTVar messages
   case Map.lookup uuid messageMap of
     Just (False, _, pid, msg, cname) -> do
@@ -254,11 +251,10 @@ multicast_agree server@Server{..} _ m uuid = do
       let new_messageMap = Map.insert uuid (True, m, pid, msg, cname) messageMap
       let list_ready = List.takeWhile (\(_, (f, _, _, _, _)) -> f) $ List.sortBy sortMessage (Map.toList new_messageMap)
       writeTVar messages new_messageMap
-      foldl (\x (key, (flag, _, _, text, cn)) -> case flag of
-          True  -> x >> multicast_deliver server text key cn
-          False -> x >> return ()
-        ) (return ()) list_ready
-    _ -> error "Should not reach here" >> return ()
+      foldl (\x (key, (flag, _, _, text, cn)) ->
+        if flag then x >> multicastDeliver server text key cn else void x)
+        (return ()) list_ready
+    _ -> error "Should not reach here"
 
 -- Sort the message buffer (process id is used to break the tie)
 sortMessage :: (ID, (Bool, Int, ProcessId, String, CName)) ->
@@ -269,8 +265,8 @@ sortMessage (_, (_, a, b, _, _)) (_, (_, c, d, _, _))
   | otherwise = if b < d then LT else GT
 
 -- The receiver deliver the message to the client. For now we just remove the other meta information
-multicast_deliver :: Server -> String -> ID -> CName -> STM()
-multicast_deliver server@Server{..} msg uuid cname = do
+multicastDeliver :: Server -> String -> ID -> CName -> STM()
+multicastDeliver server@Server{..} msg uuid cname = do
   messageMap <- readTVar messages
   writeTVar messages $ Map.delete uuid messageMap
   broadcastLocal server (Broadcast cname msg)
@@ -278,39 +274,58 @@ multicast_deliver server@Server{..} msg uuid cname = do
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 --
---                          >> MESSAGE Handling <<
+--                          >> Database Messaging <<
 --
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
-db_get :: Server -> LocalClient -> Key -> STM()
-db_get server@Server{..} LocalClient{..} k = do
+dbSend :: Server -> KVKey -> PMessage -> STM ()
+dbSend server@Server{..} k pmsg = do
   pids <- readTVar servers
-  let pmsg = GetRequest k localName
   let allpids = List.sort (spid : pids)
-  let db_pid = allpids !! (ord (head k) `mod` (length allpids))
+  let db_pid = allpids !! (ord (head k) `mod` length allpids)
   sendRemote server db_pid pmsg
 
-db_set :: Server -> LocalClient -> Key -> Value -> STM()
-db_set server@Server{..} LocalClient{..} k v = do
-  pids <- readTVar servers
-  let pmsg = SetRequest k v localName
-  let allpids = List.sort (spid : pids)
-  let db_pid = allpids !! (ord (head k) `mod` (length allpids))
-  sendRemote server db_pid pmsg
+dbWeakGet :: Server -> LocalClient -> KVKey -> STM()
+dbWeakGet server@Server{..} LocalClient{..} k =
+  dbSend server k $ GetRequest k localName
 
-dbstore_get :: Server -> Key -> CName -> STM()
-dbstore_get server@Server{..} k name = do
+dbWeakSet :: Server -> LocalClient -> KVKey -> KVVal -> STM()
+dbWeakSet server@Server{..} LocalClient{..} k v =
+  dbSend server k $ SetRequest k v localName
+
+dbstoreGet :: Server -> KVKey -> CName -> STM()
+dbstoreGet server@Server{..} k name = do
   db <- readTVar mmdb
   let msg = case Map.lookup k db of
-              Just v  -> DB $ "get() succeeds: " ++ k ++ " = " ++ v
-              Nothing -> DB $ "get() failed: No such key: " ++ k
+              Just v  -> DB v
+              Nothing -> DB ""
   void $ sendToName server name msg
 
-dbstore_set :: Server -> Key -> Value -> CName -> STM ()
-dbstore_set server@Server{..} k v name = do
+dbstoreSet :: Server -> KVKey -> KVVal -> CName -> STM ()
+dbstoreSet server@Server{..} k v name = do
   db <- readTVar mmdb
   writeTVar mmdb $ Map.insert k v db
-  void $ sendToName server name $ DB ("set() succeeds: " ++ k ++ " = " ++ v)
+  void $ sendToName server name $ DB v
+
+dbRead :: Server -> LocalClient -> String -> KVKey -> STM ()
+dbRead server@Server{..} LocalClient{..} txnId k =
+  dbSend server k $ GetRequest k localName
+
+dbCommit :: Server -> LocalClient -> String -> [String] -> STM ()
+dbCommit server@Server{..} LocalClient{..} txnId str = do
+  let l = map ((\[x, y, z] -> (x, y, read z :: Int)) . splitOn "#") str
+      l' = List.groupBy (\(x, _, _) (y, _, _) -> x == y) l
+      -- map (\x -> (fst (head x), (KVRequest spid txnId x))) l'
+      l'' = []
+  vMap <- readTVar txnVotes
+  writeTVar txnVotes $ Map.insert txnId (length l'') vMap
+  foldl (\x (k, pmsg) -> x >> dbSend server k pmsg) (return ()) l''
+
+dbAccept :: Server -> LocalClient -> String -> [String] -> STM Bool
+dbAccept server@Server{..} LocalClient{..} txnId l = undefined
+
+dbDecide :: Server -> LocalClient -> String -> [String] -> STM Bool
+dbDecide server@Server{..} LocalClient{..} txnId str = undefined
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -324,37 +339,36 @@ dbstore_set server@Server{..} k v name = do
 handleMessage :: Server -> LocalClient -> Message -> IO Bool
 handleMessage server@Server{..} client@LocalClient{..} message =
   case message of
-    DB msg -> output msg
-    Notice msg         -> output $ "*** " ++ msg
-    Tell name msg      -> output $ "*" ++ name ++ "*: " ++ msg
-    Broadcast name msg -> output $ "<" ++ name ++ ">: " ++ msg
     Command msg ->
       case words msg of
+        ["/echo", what] -> output $ "echo <" ++ what ++ ">"
         ["/kick", who] -> do
-            atomically $ kick server who localName
-            return True
+            atomically $ kick server who localName; return True
         "/tell" : who : what -> do
-            tell server client who (unwords what)
+            tell server client who (unwords what); return True
+        ["/quit"] -> return False
+        ["/broadcast", what] -> do
+            atomically $ broadcast server $ Broadcast localName what
             return True
-        ["/quit"] ->
-            return False
-        "/broadcast" : what -> do
-            atomically $ broadcast server $ Broadcast localName (unwords what)
-            return True
-        "/get" : key -> do
-            atomically $ db_get server client (unwords key)
-            return True
+        ["/get", key] -> do
+            atomically $ dbWeakGet server client key; return True
         "/set" : key : value -> do
-            atomically $ db_set server client key (unwords value)
-            return True
+            atomically $ dbWeakSet server client key (unwords value); return True
+        ["/read", txnId, key] -> do
+            atomically $ dbRead server client txnId key; return True
+        "/commit" : txnId : str -> do
+            atomically $ dbCommit server client txnId str; return True
         ('/':_):_ -> do
-            hPutStrLn clientHandle $ "Unrecognised command: " ++ msg
-            return True
+            hPutStrLn clientHandle $ "Unrecognised command: " ++ msg; return True
         _ -> do
           uuid <- genUUID
           putStrLn $ "Initiate a multicast (totally ordering) request: " ++ msg
           atomically $ multicast server msg uuid localName
           return True
+    DB msg -> output msg
+    Notice msg         -> output $ "*** " ++ msg
+    Tell name msg      -> output $ "*" ++ name ++ "*: " ++ msg
+    Broadcast name msg -> output $ "<" ++ name ++ ">: " ++ msg
   where output s = do hPutStrLn clientHandle s; return True
 
 -- Handle message received from remote client
@@ -367,7 +381,7 @@ handleRemoteMessage server@Server{..} m =
     MsgKick _ _   -> undefined
     MsgNewClient name pid -> liftIO $ atomically $ do
         ok <- checkAddClient server (ClientRemote (RemoteClient name pid))
-        when (not ok) $ sendRemote server pid (MsgKick name "SYSTEM")
+        unless ok $ sendRemote server pid (MsgKick name "SYSTEM")
     MsgClientDisconnected name pid -> liftIO $ atomically $ do
          clientmap <- readTVar clients
          case Map.lookup name clientmap of
@@ -378,20 +392,20 @@ handleRemoteMessage server@Server{..} m =
     -- Receive a request, need to queue the msg and propose a number
     MulticastRequest pid msg uuid cname -> liftIO $ do
       putStrLn (uuid ++ ": Receive MulticastRequest from " ++ show pid)
-      atomically $ multicast_propose server pid uuid msg cname
+      atomically $ multicastPropose server pid uuid msg cname
     -- Send receive propose, need to identify which msg corresponds to it
     MulticastPropose _ pval uuid -> liftIO $ do
       putStrLn (uuid ++ ": Receive MulticastPropose value " ++ show pval)
-      atomically $ do multicast_accept server pval uuid
+      atomically $ multicastAccept server pval uuid
     -- Receive the final decision for a message ordering
     MulticastDeciscion sender_pid timestamp uuid -> liftIO $ do
       putStrLn (uuid ++ ": Receive MulticastDeciscion from " ++ show sender_pid)
-      atomically $ multicast_agree server sender_pid timestamp uuid
+      atomically $ multicastAgree server sender_pid timestamp uuid
     -- Receive a set request
-    SetRequest k v cn -> liftIO $ atomically $ dbstore_set server k v cn
+    SetRequest k v cn -> liftIO $ atomically $ dbstoreSet server k v cn
     -- REceive a get reqeust
-    GetRequest k cn -> liftIO $ atomically $ dbstore_get server k cn
-    GetResponse _ _ -> undefined
+    GetRequest k cn -> liftIO $ atomically $ dbstoreGet server k cn
+    _ -> undefined
 
 -- Handle the join request by sending my self server information
 handleWhereIsReply :: Server -> WhereIsReply -> Process ()
@@ -461,9 +475,8 @@ newServerInfo server@Server{..} rsvp rid pid remote_clients = do
             -- ToDo: should remove other remote clients with this pid
             -- ToDo: also deal with conflicts
     writeTVar clients new_clientmap
-    when rsvp $ do
-      sendRemote server pid
-         (MsgServerInfo False ringId spid [ localName c | ClientLocal c <- Map.elems new_clientmap ])
+    when rsvp $ sendRemote server pid
+      (MsgServerInfo False ringId spid [ localName c | ClientLocal c <- Map.elems new_clientmap ])
     -- monitor the new server
     return (when (pid `notElem` old_pids) $ void $ monitor pid)
 
@@ -485,10 +498,6 @@ deleteClient server@Server{..} name = do
     modifyTVar' clients $ Map.delete name
     broadcastLocal server $ Notice $ name ++ " has disconnected"
 
-genUUID :: IO String
-genUUID = do
-    x <- U4.nextRandom
-    return $ U.toString x
 
 -- register remotable (using distributed-process framework)
 remotable ['dNode]

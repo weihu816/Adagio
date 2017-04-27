@@ -7,7 +7,7 @@ license:             BSD3
 license-file:        LICENSE
 author:              Wei Hu
 maintainer:          weihu816@gmail.com
-copyright:           Wei Hu
+copyright:           Wei Hu, Yisi Xu
 category:            web
 build-type:          Simple
 extra-source-files:  README.md
@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib, KVStore, Worker
+  exposed-modules:     KVStore, Worker, Utils, Txn, AppServer
   build-depends:       base >= 4.7 && < 5
                        , stm == 2.4.*
                        , containers
@@ -25,10 +25,12 @@ library
                        , binary >=0.6.3 && <= 0.9
                        , template-haskell
                        , transformers
-                       , distributed-process == 0.6.*
+                       , distributed-process
                        , distributed-process-simplelocalnet == 0.2.*
                        , distributed-static >= 0.2 && < 0.4
                        , uuid
+                       , network-transport-tcp
+                       , split
   default-language:    Haskell2010
 
 executable node
@@ -50,26 +52,6 @@ executable node
                      , distributed-static >= 0.2 && < 0.4
   default-language:    Haskell2010
 
-executable appserver
-  hs-source-dirs:      app
-  main-is:             AppServer.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
-  build-depends:       base
-                     , Adagio
-                     , stm == 2.4.*
-                     , containers
-                     , network
-                     , network-uri
-                     , async == 2.*
-                     , binary >=0.6.3 && <= 0.9
-                     , template-haskell
-                     , transformers
-                     , distributed-process == 0.6.*
-                     , distributed-process-simplelocalnet == 0.2.*
-                     , distributed-static >= 0.2 && < 0.4
-                     , network-transport-tcp
-  default-language:    Haskell2010
-
 executable clientui
   hs-source-dirs:      app
   main-is:             ClientUI.hs
@@ -88,12 +70,24 @@ executable clientui
                      , split
   default-language:    Haskell2010
 
-test-suite Adagio-test
+test-suite txt
   type:                exitcode-stdio-1.0
   hs-source-dirs:      test
   main-is:             Spec.hs
   build-depends:       base
                      , Adagio
+                     , stm == 2.4.*
+                     , containers
+                     , network
+                     , network-uri
+                     , async == 2.*
+                     , binary >=0.6.3 && <= 0.9
+                     , template-haskell
+                     , transformers
+                     , distributed-process == 0.6.*
+                     , distributed-process-simplelocalnet == 0.2.*
+                     , distributed-static >= 0.2 && < 0.4
+                     , network-transport-tcp
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 
