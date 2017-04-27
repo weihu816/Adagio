@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     KVStore, Worker, Utils, Txn, AppServer, Client
+  exposed-modules:     KVStore, Worker, Utils, Txn, AppServer
   build-depends:       base >= 4.7 && < 5
                        , stm == 2.4.*
                        , containers

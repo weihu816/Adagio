@@ -2,7 +2,7 @@ import AppServer
 import Txn
 import Test.HUnit
 import Data.Word
-import Client
+import Utils
 import Worker
 
 main :: IO ()

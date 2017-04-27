@@ -52,7 +52,7 @@ import System.Socket.Type.Stream
 import System.Socket.Protocol.TCP
 import System.Environment
 
-import Client
+import Utils
 
 newtype CustomEvent = Recv String deriving Show
 
