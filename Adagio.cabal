@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     KVStore, Worker, Utils, Txn, AppServer
+  exposed-modules:     KVStore, Worker, Utils, Txn, AppServer, Client
   build-depends:       base >= 4.7 && < 5
                        , stm == 2.4.*
                        , containers
@@ -30,6 +30,9 @@ library
                        , distributed-static >= 0.2 && < 0.4
                        , uuid
                        , network-transport-tcp
+                       , socket
+                       , bytestring
+                       , time
                        , split
   default-language:    Haskell2010
 
@@ -66,8 +69,6 @@ executable clientui
                      , vty
                      , text-zipper
                      , bytestring
-                     , time
-                     , split
   default-language:    Haskell2010
 
 test-suite txt
@@ -88,6 +89,8 @@ test-suite txt
                      , distributed-process-simplelocalnet == 0.2.*
                      , distributed-static >= 0.2 && < 0.4
                      , network-transport-tcp
+                     , HUnit
+                     , socket
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 
