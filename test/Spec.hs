@@ -36,3 +36,4 @@ testBreakLine = "multiline" ~:
     breakStringIntoLines "abcde" 2 ~?= "ab\ncd\ne",
     breakStringIntoLines "" 3 ~?= "",
     breakStringIntoLines "abc" 0 ~?= "abc"]
+

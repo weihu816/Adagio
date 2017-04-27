@@ -8,12 +8,19 @@ import System.Socket.Family.Inet
 import System.Socket.Type.Stream
 import System.Socket.Protocol.TCP
 
+-- | Check whether a string starts with a certain prefix
 startsWith' :: String -> String -> Bool
 startsWith' _ [] = True
 startsWith' [] _ = False
-startsWith' (hl:tl) (hs:ts) 
-  | hl == hs  = startsWith' tl ts
+startsWith' (x:xs) (y:ys) 
+  | x == y  = startsWith' xs ys
   | otherwise = False
+
+-- | Utility function for ClientUI, decide how many lines will a string be split
+getLineNumber :: String -> Int -> Int
+getLineNumber str col = case col of
+                          0 -> 3
+                          _ -> quot (length str) col + 3
 
 -- | convert list of 4 elements to tuple
 -- return tuple of 4 0's when number of elements is not 4
@@ -24,10 +31,13 @@ tupify4 _            = Nothing
 -- | convert string of address to tuple of 8-bit unsigned integer type
 stringToAddrTuple :: String -> Maybe (Word8, Word8, Word8, Word8)
 stringToAddrTuple str = let segs = splitOn "." str in -- assume valid input here
-  tupify4 $ (foldr (\x res -> let num = read x :: Integer in
-                              if num > 0 && num <= 255
-                                then fromInteger num : res
-                              else fromInteger 0 : res) [] segs)
+  tupify4
+    (foldr
+       (\ x res ->
+          let num = read x :: Integer in
+            if num > 0 && num <= 255 then fromInteger num : res else 0 : res)
+       []
+       segs)
 
 -- | create a socket and connect to it by remote IP address and port
 constructSocket :: InetAddress -> InetPort -> IO (Socket Inet Stream TCP)
@@ -48,7 +58,7 @@ breakStringIntoLines :: String -> Int -> String
 breakStringIntoLines str 0 = str
 breakStringIntoLines str n = 
   aux str n 0 0 "" where
-    aux str col cnt idx res = 
-      if length str == cnt then res
-      else if idx == col then aux str col cnt 0 (res ++ "\n")
-           else aux str col (cnt + 1) (idx + 1) (res ++ [str !! cnt])
+    aux str col cnt idx res
+      | length str == cnt = res
+      | idx == col = aux str col cnt 0 (res ++ "\n")
+      | otherwise = aux str col (cnt + 1) (idx + 1) (res ++ [str !! cnt])

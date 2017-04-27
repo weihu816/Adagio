@@ -30,8 +30,6 @@ library
                        , distributed-static >= 0.2 && < 0.4
                        , uuid
                        , socket
-                       , vty
-                       , text-zipper
                        , bytestring
                        , time
                        , split

@@ -53,8 +53,7 @@ import System.Environment
 
 import Client
 
-data CustomEvent = Recv String
-                 deriving Show
+newtype CustomEvent = Recv String deriving Show
 
 data Name = VP1
           | Edit1
@@ -80,7 +79,7 @@ drawUI :: St -> [T.Widget Name]
 drawUI st = [ui]
     where
         scrollArea = viewport VP1 Vertical $
-                       vBox $ (str <$> st^.messageList)
+                       vBox (str <$> st^.messageList)
 
         e1 = F.withFocusRing (st^.focusRing) E.renderEditor (st^.edit1)
 
@@ -93,18 +92,16 @@ drawUI st = [ui]
                str (if wasClicked then ">>" <> "Send" <> "<<" else "Send")
 
         ui = C.center $ B.borderWithLabel (str "Messages") $  -- hLimit 60 $ vLimit 21 $
-             vBox [ scrollArea, B.hBorder, hBox [(vLimit 9 $ e1) <+> 
-                                                 (padLeftRight 1 $ padTopBottom 2 $ vLimit 5 $ 
-                                                  hLimit 20 $ C.vCenter $ b1)]
-                  ]
+             vBox [ scrollArea, B.hBorder, hBox [vLimit 9 e1 <+> padLeftRight 1
+                    (padTopBottom 2 $ vLimit 5 $ hLimit 20 $ C.vCenter b1)]]
 
 vp1Scroll :: M.ViewportScroll Name
 vp1Scroll = M.viewportScroll VP1
 
 appEvent :: St -> T.BrickEvent Name CustomEvent -> T.EventM Name (T.Next St)
-appEvent st (T.MouseDown n _ _ loc)     = processButton st n loc
-appEvent st (T.MouseUp _ _ _)           = M.continue $ st & lastClick .~ Nothing
-appEvent st (T.VtyEvent (V.EvMouseUp _ _ _))  = M.continue $ st & lastClick .~ Nothing
+appEvent st (T.MouseDown n _ _ loc)           = processButton st n loc
+appEvent st T.MouseUp{}                       = M.continue $ st & lastClick .~ Nothing
+appEvent st (T.VtyEvent V.EvMouseUp{})        = M.continue $ st & lastClick .~ Nothing
 appEvent st (T.VtyEvent (V.EvKey V.KDown [])) = M.vScrollBy vp1Scroll 1 >> M.continue st
 appEvent st (T.VtyEvent (V.EvKey V.KUp []))   = M.vScrollBy vp1Scroll (-1) >> M.continue st
 appEvent st (T.VtyEvent ev)                   =
@@ -120,29 +117,27 @@ appEvent st (T.AppEvent (Recv msg))           = processViewport st msg
 
 --appEvent st _                                 = M.continue st
 
-getLineNumber :: String -> Int -> Int
-getLineNumber str col = case col of
-                          0 -> 3
-                          _ -> (quot (length str) col) + 3
-
+-- | modify contents in viewport, modify visible parts of viewport
 processViewport :: St -> String -> T.EventM Name (T.Next St)
-processViewport st msg = do
-  liftIO (getTimeStringIO) >>= \timeStr -> M.vScrollBy vp1Scroll (getLineNumber msg 80) >> 
-                                 (M.continue $ st & clockIO .~ getTimeStringIO
-                                                  & messageList %~ (++ [timeStr ++ "\n" ++ 
-                                                    (breakStringIntoLines msg 80) ++ "\n"]))
+processViewport st msg = 
+  liftIO getTimeStringIO >>= \timeStr -> 
+    M.vScrollBy vp1Scroll (getLineNumber msg 80) >>
+      M.continue
+        (st & clockIO .~ getTimeStringIO & messageList %~
+           (++ [timeStr ++ "\n" ++ breakStringIntoLines msg 80 ++ "\n"]))
 
+-- | when send button is clicked, send msg and clear input text box 
 processButton :: St -> Name -> T.Location -> T.EventM Name (T.Next St)
 processButton st n loc = 
   case n of 
     Button1 -> do
                  let buffer = unlines (E.getEditContents $ st^.edit1)
                  if length buffer > 1 then 
-                     liftIO (do sendMsgToServer buffer st) >> 
+                     liftIO (sendMsgToServer buffer st) >> 
                        if startsWith' buffer "/quit" then M.halt st
-                       else (M.continue $ st & lastClick .~ Just (n, loc)
-                                    & edit1 %~ E.applyEdit killToBOL
-                                    & content .~ buffer)
+                       else M.continue $ st & lastClick .~ Just (n, loc)
+                                            & edit1 %~ E.applyEdit killToBOL
+                                            & content .~ buffer
                  else 
                    M.continue $ st & lastClick .~ Just (n, loc)
     _       -> M.continue st
@@ -152,10 +147,10 @@ processEditor :: St -> T.EventM Name (T.Next St)
 processEditor st = do
   let buffer = unlines (E.getEditContents $ st^.edit1)
   if length buffer > 1 then 
-    liftIO (do sendMsgToServer buffer st) >> 
+    liftIO (sendMsgToServer buffer st) >> 
       if startsWith' buffer "/quit" then M.halt st
       else 
-        (M.continue $ st & edit1 %~ E.applyEdit killToBOL & content .~ buffer)
+        M.continue $ st & edit1 %~ E.applyEdit killToBOL & content .~ buffer
   else 
     M.continue st
 
@@ -168,19 +163,19 @@ sendMsgToServer msg st = do
   return st
 
 -- | initialize all fields in state
-initialState :: (Socket Inet Stream TCP) -> InetAddress -> InetPort -> St
+initialState :: Socket Inet Stream TCP -> InetAddress -> InetPort -> St
 initialState sock addr port =
-    St ([])
+    St []
        (F.focusRing [Edit1])
        (E.editor Edit1 (str . unlines) Nothing "")
-       (sock)
-       (addr)
-       (port)
-       (getTimeStringIO)
-       ([])
-       ("")
-       (0)
-       (Nothing)
+       sock
+       addr
+       port
+       getTimeStringIO
+       []
+       ""
+       0
+       Nothing
 
 -- | Attribute map for this application
 theMap :: A.AttrMap
@@ -190,6 +185,7 @@ theMap = A.attrMap V.defAttr
     , ("send_button",     V.white `on` V.green)
     ]
 
+-- | Cursor focus
 appCursor :: St -> [T.CursorLocation Name] -> Maybe (T.CursorLocation Name)
 appCursor = F.focusRingCursor (^.focusRing)
 
@@ -205,14 +201,14 @@ theApp =
 -- | Thread used to receive incoming messages
 -- When there is message available at socket, write to BChan and trigger
 -- Brick custom event
-recvThread :: (Socket Inet Stream TCP) -> BChan CustomEvent -> IO ()
+recvThread :: Socket Inet Stream TCP -> BChan CustomEvent -> IO ()
 recvThread sock chan = do
     bs <- receive sock 1024 mempty
     writeBChan chan $ Recv (unpack bs)
 
 -- | get to run when invalid ip address is provided
 addressExit :: String -> IO ()
-addressExit addr = do
+addressExit addr = 
   putStrLn $ "Invalid IP address format" ++ addr
 
 main :: IO ()
@@ -225,7 +221,7 @@ main = do
   [addr, port] <- getArgs
   let serverPort' = read port :: Integer
   if serverPort' < 0 || serverPort' > 65536
-    then do putStrLn $ "Invalid port number" ++ port
+    then putStrLn $ "Invalid port number" ++ port
   else 
     let serverPort = fromInteger serverPort' in
     let tempAddr = stringToAddrTuple addr in
