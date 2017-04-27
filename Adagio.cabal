@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib, KVStore, Worker
+  exposed-modules:     Lib, KVStore, Worker, Client
   build-depends:       base >= 4.7 && < 5
                        , stm == 2.4.*
                        , containers
@@ -29,6 +29,12 @@ library
                        , distributed-process-simplelocalnet == 0.2.*
                        , distributed-static >= 0.2 && < 0.4
                        , uuid
+                       , socket
+                       , vty
+                       , text-zipper
+                       , bytestring
+                       , time
+                       , split
   default-language:    Haskell2010
 
 executable node
@@ -84,8 +90,6 @@ executable clientui
                      , vty
                      , text-zipper
                      , bytestring
-                     , time
-                     , split
   default-language:    Haskell2010
 
 test-suite Adagio-test
@@ -94,6 +98,8 @@ test-suite Adagio-test
   main-is:             Spec.hs
   build-depends:       base
                      , Adagio
+                     , HUnit
+                     , socket
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 
