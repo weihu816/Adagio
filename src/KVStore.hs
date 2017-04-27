@@ -7,15 +7,15 @@ module KVStore
   , Client(..)
   , RemoteClient(..)
   , LocalClient(..)
-  , Key
+  , KVKey, KVVal
   , CName
-  , Value
   , RId
   , ID
   , newLocalClient
   , clientName
   , Message(..)
   , PMessage(..)
+  , TxnStatue(..)
   ) where
 
 import Data.Binary
@@ -29,25 +29,32 @@ import Data.Typeable
 
 
 -- Key-Value Storage 
-type Key   = String
-type Value = String
+type KVKey = String
+type KVVal = String
 type RId   = Int
-type ID = String
+type ID    = String
+type TxnId = String
+type KVVersion = Int
+ 
+
+data TxnStatue = TXN_UNDECIDED | TXN_COMMITED | TXN_ABORTED
 
 -- Server
 data Server = Server {
   clients   :: TVar (Map String Client),
-  proxychan :: TChan (Process ()),          -- sendRemote
+  proxychan :: TChan (Process ()),                 -- sendRemote
   servers   :: TVar [ProcessId],
   ftable    :: TVar (Map RId (RId, ProcessId)),    -- ftable in the Chord ring
   peers     :: TVar [(RId, ProcessId)],
   ringSize  :: Int,
-  ringId    :: RId,                         -- Todo: Should really be unique
+  ringId    :: RId,                                -- TODO: Should really be unique
   spid      :: ProcessId,
-  counter   :: TVar (Int, Int),             -- largest sequence number proposed and observed
-  votes     :: TVar (Map ID (Int, Int)),    -- Sender: uuid => (remain count, max)
+  counter   :: TVar (Int, Int),                     -- largest sequence number proposed and observed
+  votes     :: TVar (Map ID (Int, Int)),            -- Sender: uuid => (remain count, max)
   messages  :: TVar (Map ID (Bool, Int, ProcessId, String, CName)), -- Receiver: uuid => (flag, pval, pid, msg)
-  mmdb      :: TVar (Map Key Value)
+  mmdb      :: TVar (Map KVKey KVVal),                -- In memory database
+  txns      :: TVar (Map TxnId (TxnStatue, Bool, [(KVKey, KVVal, KVVersion)])),  -- isDirty
+  txnVotes  :: TVar (Map ID Int)
 }
 
 -- Client
@@ -94,6 +101,7 @@ instance Binary Message
 -- PMessage
 data PMessage
   = MsgServerInfo         Bool RId ProcessId [CName]
+  | MsgAppServer          ProcessId
   | MsgSend               CName Message
   | MsgBroadcast          Message
   | MsgKick               CName CName
@@ -102,10 +110,11 @@ data PMessage
   | MulticastRequest      ProcessId String ID CName
   | MulticastPropose      ProcessId Int ID -- pid propose uuid
   | MulticastDeciscion    ProcessId Int ID -- pid propose uuid
-  | SetRequest            Key Value CName
-  | GetRequest            Key CName
-  | GetResponse           Key (Maybe Value)
+  | SetRequest            KVKey KVVal CName
+  | GetRequest            KVKey CName
+  | GetResponse           KVKey (Maybe KVVal) 
+  | KVRequest             ProcessId TxnId [(KVKey, KVVal, KVVersion)]
+  | KVResponse            ProcessId TxnId
   deriving (Typeable, Generic)
 instance Binary PMessage
-
 
