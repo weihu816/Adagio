@@ -8,8 +8,9 @@ import Lens.Micro.TH
 import qualified Graphics.Vty as V
 
 import Data.Monoid ((<>))
-import Data.Text.Zipper (killToBOL)
+import Data.Text.Zipper (killToBOL, killToEOL, moveCursor)
 import Data.ByteString.Char8 (unpack, pack)
+import Data.Tuple (swap)
 
 import Control.Monad (void, forever)
 import Control.Concurrent (threadDelay, forkIO)
@@ -91,7 +92,7 @@ drawUI st = [ui]
                padLeftRight (if wasClicked then 1 else 3) $
                str (if wasClicked then ">>" <> "Send" <> "<<" else "Send")
 
-        ui = C.center $ B.borderWithLabel (str "Messages") $  -- hLimit 60 $ vLimit 21 $
+        ui = C.center $ B.borderWithLabel (str "Messages") $ 
              vBox [ scrollArea, B.hBorder, hBox [vLimit 9 e1 <+> padLeftRight 1
                     (padTopBottom 2 $ vLimit 5 $ hLimit 20 $ C.vCenter b1)]]
 
@@ -99,23 +100,21 @@ vp1Scroll :: M.ViewportScroll Name
 vp1Scroll = M.viewportScroll VP1
 
 appEvent :: St -> T.BrickEvent Name CustomEvent -> T.EventM Name (T.Next St)
-appEvent st (T.MouseDown n _ _ loc)           = processButton st n loc
+appEvent st (T.MouseDown n _ _ loc)           = mouseClick st n loc
 appEvent st T.MouseUp{}                       = M.continue $ st & lastClick .~ Nothing
 appEvent st (T.VtyEvent V.EvMouseUp{})        = M.continue $ st & lastClick .~ Nothing
 appEvent st (T.VtyEvent (V.EvKey V.KDown [])) = M.vScrollBy vp1Scroll 1 >> M.continue st
 appEvent st (T.VtyEvent (V.EvKey V.KUp []))   = M.vScrollBy vp1Scroll (-1) >> M.continue st
 appEvent st (T.VtyEvent ev)                   =
     case ev of
-        V.EvKey V.KEsc []        -> M.halt st
+        V.EvKey V.KEsc []        -> liftIO (sendMsgToServer "/quit" st) >>  M.halt st
         V.EvKey V.KEnter []      -> processEditor st
         _                        -> M.continue =<< 
                                       case F.focusGetCurrent (st^.focusRing) of
                                         Just Edit1 -> T.handleEventLensed st 
-                                                        edit1 E.handleEditorEvent ev
+                                                      edit1 E.handleEditorEvent ev
                                         Nothing    -> return st
 appEvent st (T.AppEvent (Recv msg))           = processViewport st msg
-
---appEvent st _                                 = M.continue st
 
 -- | modify contents in viewport, modify visible parts of viewport
 processViewport :: St -> String -> T.EventM Name (T.Next St)
@@ -127,8 +126,8 @@ processViewport st msg =
            (++ [timeStr ++ "\n" ++ breakStringIntoLines msg 80 ++ "\n"]))
 
 -- | when send button is clicked, send msg and clear input text box 
-processButton :: St -> Name -> T.Location -> T.EventM Name (T.Next St)
-processButton st n loc = 
+mouseClick :: St -> Name -> T.Location -> T.EventM Name (T.Next St)
+mouseClick st n loc = 
   case n of 
     Button1 -> do
                  let buffer = unlines (E.getEditContents $ st^.edit1)
@@ -137,10 +136,14 @@ processButton st n loc =
                        if startsWith' buffer "/quit" then M.halt st
                        else M.continue $ st & lastClick .~ Just (n, loc)
                                             & edit1 %~ E.applyEdit killToBOL
+                                            & edit1 %~ E.applyEdit killToEOL
                                             & content .~ buffer
                  else 
                    M.continue $ st & lastClick .~ Just (n, loc)
-    _       -> M.continue st
+    Edit1   -> do let T.Location tmp = loc
+                  M.continue $ st & lastClick .~ Just (n, loc)
+                                  & edit1 %~ E.applyEdit (moveCursor (swap tmp))
+    _       -> M.continue $ st & lastClick .~ Just (n, loc)
 
 -- | read user input from edit area and send to remote server
 processEditor :: St -> T.EventM Name (T.Next St)
@@ -150,7 +153,9 @@ processEditor st = do
     liftIO (sendMsgToServer buffer st) >> 
       if startsWith' buffer "/quit" then M.halt st
       else 
-        M.continue $ st & edit1 %~ E.applyEdit killToBOL & content .~ buffer
+        M.continue $ st & edit1 %~ E.applyEdit killToBOL 
+                        & edit1 %~ E.applyEdit killToEOL
+                        & content .~ buffer
   else 
     M.continue st
 
