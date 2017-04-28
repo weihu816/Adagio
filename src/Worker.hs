@@ -440,7 +440,7 @@ handleMessage server@Server{..} client@LocalClient{..} message =
         ["/read", key] -> do
             atomically $ dbRead server client key; return True
         "/commit" : txnId : str -> do
-            putStrLn $ "Receve a transaction: " ++ txnId
+            putStrLn $ "Receve a transaction: " ++ txnId ++ " " ++ (unwords str)
             atomically $ dbCommit server client txnId str localName; return True
         ('/':_):_ -> do
             hPutStrLn clientHandle $ "Unrecognised command: " ++ msg; return True
@@ -490,7 +490,7 @@ handleRemoteMessage server@Server{..} m =
     -- REceive a get reqeust
     GetRequest k cn b -> liftIO $ atomically $ dbstoreGet server k cn b
     KVRequest pid txnId options -> liftIO $ do
-      putStrLn (txnId ++ ": Receive KVRequest from " ++ show pid)
+      putStrLn (txnId ++ ": Receive KVRequest " ++ show options)
       atomically $ dbVote server pid txnId options
     KVResponse pid txnId vote -> liftIO $ do
       putStrLn (txnId ++ ": Receive KVResponse from " ++ show pid)
@@ -530,8 +530,10 @@ checkAddClient server@Server{..} client = do
     let name = clientName client
     if Map.member name clientmap then return False
     else do writeTVar clients (Map.insert name client clientmap)
-            when (name /= "AppServer") (broadcastLocal server $ Notice $ name ++ " has connected")
-            return True
+            case name of 
+              '/':_  -> return True
+              _ -> do broadcastLocal server $ Notice $ name ++ " has connected"
+                      return True
 
 --
 disconnectLocalClient :: Server -> CName -> IO ()

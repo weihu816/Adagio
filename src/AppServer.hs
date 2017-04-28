@@ -6,6 +6,7 @@ module AppServer where
 import qualified Data.List as List
 import Network hiding (sClose)
 import System.IO
+import Utils
 
 hostname :: String
 hostname = "127.0.0.1"
@@ -13,16 +14,16 @@ hostname = "127.0.0.1"
 port :: String
 port = "55550"
 
-clientname :: String
-clientname = "AppServer"
+-- clientname :: String
+-- clientname = "AppServer"
 
 doRead :: String -> IO (Maybe (String, Int))
 doRead key = do
     hdl <- connectTo hostname $ PortNumber (read port :: PortNumber)
     hSetBuffering hdl NoBuffering
     _ <- hGetLine hdl
-    -- clientname <- genUUID
-    hPutStrLn hdl clientname
+    clientname <- genUUID
+    hPutStrLn hdl ('/':clientname)
     hPutStrLn hdl $ "/read " ++ key
     str <- hGetLine hdl
     -- putStrLn $ "[DEBUG] doRead: " ++ key ++ " -> " ++ str
@@ -39,8 +40,8 @@ doCommit txnId l = do
     hdl <- connectTo hostname $ PortNumber (read port :: PortNumber)
     hSetBuffering hdl NoBuffering
     _ <- hGetLine hdl
-    -- clientname <- genUUID
-    hPutStrLn hdl clientname
+    clientname <- genUUID
+    hPutStrLn hdl ('/':clientname)
     let s = List.intercalate " " $ map (\(x, y, z) -> x++"#"++y++"#"++(show z)) l
     hPutStrLn hdl $ "/commit " ++ txnId ++ " " ++ s
     str <- hGetLine hdl
