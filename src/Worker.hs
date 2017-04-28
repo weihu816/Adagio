@@ -376,7 +376,7 @@ dbAccept server@Server{..} apid txnId vote = do
         writeTVar txnVotes $ Map.insert txnId (c - 1, Set.insert apid ps, TXN_ABORTED, cname) vMap
         let pmsg = KVResult spid txnId DecisionAbort
         mapM_ (\pid -> sendRemote server pid pmsg) (Set.insert apid ps)
-    _ -> error "dbAccept should not reach here" >> return ()
+    _ -> return ()
 
 dbDecide :: Server -> ProcessId -> TxnId -> KVDecision -> STM ()
 dbDecide server@Server{..} pid txnId decision = do

@@ -1,0 +1,17 @@
+/set ROOT 1000
+/set C1 1
+/set C2 2
+
+txn <- beginTxn
+readTxn txn "ROOT"
+readTxn txn "C1"
+writeTxn txn "ROOT" "1001"
+writeTxn txn "C1" "0"
+commitTxn txn
+
+txn <- beginTxn
+readTxn txn "ROOT"
+readTxn txn "C2"
+writeTxn txn "ROOT" "1002"
+writeTxn txn "C2" "0"
+commitTxn txn
