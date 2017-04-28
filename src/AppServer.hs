@@ -6,7 +6,6 @@ module AppServer where
 import qualified Data.List as List
 import Network hiding (sClose)
 import System.IO
-import Utils
 
 hostname :: String
 hostname = "127.0.0.1"
@@ -14,18 +13,20 @@ hostname = "127.0.0.1"
 port :: String
 port = "55550"
 
+clientname :: String
+clientname = "AppServer"
 
 doRead :: String -> IO (Maybe (String, Int))
 doRead key = do
     hdl <- connectTo hostname $ PortNumber (read port :: PortNumber)
     hSetBuffering hdl NoBuffering
     _ <- hGetLine hdl
-    clientname <- genUUID
+    -- clientname <- genUUID
     hPutStrLn hdl clientname
-    hPutStrLn hdl $ "/get " ++ key
+    hPutStrLn hdl $ "/read " ++ key
     str <- hGetLine hdl
-    hClose hdl
     putStrLn $ "[DEBUG] doRead: " ++ key ++ " -> " ++ str
+    hClose hdl
     case words str of
         [val, ver] -> return $ Just (val, read ver :: Int)
         _ -> return Nothing
@@ -36,17 +37,17 @@ doCommit txnId l = do
     hdl <- connectTo hostname $ PortNumber (read port :: PortNumber)
     hSetBuffering hdl NoBuffering
     _ <- hGetLine hdl
-    clientname <- genUUID
+    -- clientname <- genUUID
     hPutStrLn hdl clientname
     let s = List.intercalate " " $ map (\(x, y, z) -> x++"#"++y++"#"++(show z)) l
     hPutStrLn hdl $ "/commit " ++ txnId ++ " " ++ s
     str <- hGetLine hdl
     hClose hdl
-    putStrLn $ "[DEBUG] doCommit: " ++ txnId
+    putStrLn $ "[DEBUG] doCommit: " ++ txnId ++ " " ++ str
     case words str of
         ["OK"] -> return True
         _ -> return False
-
+    
 -- This does not work...
 -- doRead2 :: IO ()
 -- doRead2 = withSocketsDo $ do

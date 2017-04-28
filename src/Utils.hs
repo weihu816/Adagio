@@ -48,7 +48,7 @@ stringToAddrTuple str = let segs = splitOn "." str in -- assume valid input here
 
 -- | create a socket and connect to it by remote IP address and port
 constructSocket :: InetAddress -> InetPort -> IO (Socket Inet Stream TCP)
-constructSocket addr port = do
+constructSocket _ _ = do
   sock <- socket :: IO (Socket Inet Stream TCP)
   setSocketOption sock (ReuseAddress True)
   return sock
@@ -65,7 +65,7 @@ breakStringIntoLines :: String -> Int -> String
 breakStringIntoLines str 0 = str
 breakStringIntoLines str n = 
   aux str n 0 0 "" where
-    aux str col cnt idx res
-      | length str == cnt = res
-      | idx == col = aux str col cnt 0 (res ++ "\n")
-      | otherwise = aux str col (cnt + 1) (idx + 1) (res ++ [str !! cnt])
+    aux s col cnt idx res
+      | length s == cnt = res
+      | idx == col = aux s col cnt 0 (res ++ "\n")
+      | otherwise = aux s col (cnt + 1) (idx + 1) (res ++ [s !! cnt])

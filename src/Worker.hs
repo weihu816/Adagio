@@ -17,6 +17,7 @@ import Text.Printf
 import Network
 import System.IO
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Map (Map)
 import Data.List.Split (splitOn)
 import qualified Data.List as List
@@ -24,6 +25,7 @@ import Control.Exception
 import Data.Char
 import KVStore
 import Utils
+import Data.Tuple.Select
 
 -- Every node will be equal (master)
 master :: Backend -> String -> String -> String -> Process ()
@@ -74,9 +76,12 @@ newNode pids rsize rid = do
     f <- newTVarIO $ Map.fromList $ map (\t -> (t, (rid, pid)))
          [0 .. floor (logBase 2.0 (fromIntegral rsize)) - 1]
     d <- newTVarIO Map.empty
+    t <- newTVarIO Map.empty
+    tv <- newTVarIO Map.empty
     return Server { clients = c, servers = s, proxychan = o, spid = pid,
                     peers = p, ftable = f, ringSize = rsize, ringId = rid,
-                    counter = x, votes = v, messages = m, mmdb = d }
+                    counter = x, votes = v, messages = m, mmdb = d,
+                    txns = t, txnVotes = tv}
 
 --------------------------------------------------------------------------------
 
@@ -87,11 +92,11 @@ socketListener server port = withSocketsDo $ do
   printf "Listening on port %d\n" port
   forever $ do (h, addr, p) <- accept sock
                printf "Accepted connection from %s: %s\n" addr (show p)
-               forkFinally (talk server h) (\_ -> hClose h)
+               forkFinally (registerClient server h) (\_ -> hClose h)
 
 -- Read the client identifier (unique)
-talk :: Server -> Handle -> IO ()
-talk server@Server{..} h = do
+registerClient :: Server -> Handle -> IO ()
+registerClient server@Server{..} h = do
     hSetNewlineMode h universalNewlineMode
     hSetBuffering h LineBuffering
     readName
@@ -165,7 +170,13 @@ broadcast server@Server{..} msg = do
     broadcastLocal server msg
 
 kick :: Server -> CName -> CName -> STM ()
-kick = undefined
+kick server@Server{..} who by = do
+  clientmap <- readTVar clients
+  case Map.lookup who clientmap of
+    Nothing -> void $ sendToName server by (Notice $ who ++ " is not connected")
+    Just (ClientLocal v) -> do writeTVar (clientKicked v) $ Just ("by "++by)
+                               void $ sendToName server by (Notice $ "you kicked "++who)
+    Just (ClientRemote v) -> sendRemote server (clientHome v) (MsgKick who by)
 
 tell :: Server -> LocalClient -> CName -> String -> IO ()
 tell server@Server{..} LocalClient{..} who msg = do
@@ -224,14 +235,13 @@ multicastAccept server@Server{..} pval uuid = do -- update vote map
       let new_c = c - 1             -- new counter for the remaining votes
       let new_max = max pval m      -- the largest proposed value
       if new_c == 0 then do         -- all responses are collected
-        -- delete the entry
-        writeTVar votes $ Map.delete uuid voteMap
+        writeTVar votes $ Map.delete uuid voteMap -- delete the entry
         multicastDecision server uuid new_max
-      else do               -- still waiting for other responses
+      else do                       -- still waiting for other responses
         (p_val, a_val) <- readTVar counter
         writeTVar counter (p_val, max new_max a_val)
         writeTVar votes $ Map.insert uuid (new_c, new_max) voteMap
-    _ -> error "Should not reach here"
+    _ -> return ()
 
 -- Proposer makes the decision after collectioning all the responses
 multicastDecision :: Server -> ID -> Int -> STM ()
@@ -254,7 +264,7 @@ multicastAgree server@Server{..} _ m uuid = do
       foldl (\x (key, (flag, _, _, text, cn)) ->
         if flag then x >> multicastDeliver server text key cn else void x)
         (return ()) list_ready
-    _ -> error "Should not reach here"
+    _ -> return ()
 
 -- Sort the message buffer (process id is used to break the tie)
 sortMessage :: (ID, (Bool, Int, ProcessId, String, CName)) ->
@@ -278,6 +288,7 @@ multicastDeliver server@Server{..} msg uuid cname = do
 --
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
+-- In memory database operations
 dbSend :: Server -> KVKey -> PMessage -> STM ()
 dbSend server@Server{..} k pmsg = do
   pids <- readTVar servers
@@ -287,45 +298,113 @@ dbSend server@Server{..} k pmsg = do
 
 dbWeakGet :: Server -> LocalClient -> KVKey -> STM()
 dbWeakGet server@Server{..} LocalClient{..} k =
-  dbSend server k $ GetRequest k localName
+  dbSend server k $ GetRequest k localName False
 
 dbWeakSet :: Server -> LocalClient -> KVKey -> KVVal -> STM()
 dbWeakSet server@Server{..} LocalClient{..} k v =
   dbSend server k $ SetRequest k v localName
 
-dbstoreGet :: Server -> KVKey -> CName -> STM()
-dbstoreGet server@Server{..} k name = do
+dbstoreGet :: Server -> KVKey -> CName -> Bool -> STM()
+dbstoreGet server@Server{..} k name b = do
   db <- readTVar mmdb
   let msg = case Map.lookup k db of
-              Just v  -> DB v
+              Just (v, v')  -> if b then DB (v ++ " " ++ (show v')) 
+                               else DB v
               Nothing -> DB ""
   void $ sendToName server name msg
 
 dbstoreSet :: Server -> KVKey -> KVVal -> CName -> STM ()
 dbstoreSet server@Server{..} k v name = do
   db <- readTVar mmdb
-  writeTVar mmdb $ Map.insert k v db
+  case Map.lookup k db of
+    Nothing -> writeTVar mmdb $ Map.insert k (v, 0) db
+    Just (_, ver) -> writeTVar mmdb $ Map.insert k (v, ver) db
   void $ sendToName server name $ DB v
 
-dbRead :: Server -> LocalClient -> String -> KVKey -> STM ()
-dbRead server@Server{..} LocalClient{..} txnId k =
-  dbSend server k $ GetRequest k localName
+-- Database Two Phase Transaction with Optimistic Concurrency Control
+dbRead :: Server -> LocalClient -> KVKey -> STM ()
+dbRead server@Server{..} LocalClient{..} k =
+  dbSend server k $ GetRequest k localName True
 
-dbCommit :: Server -> LocalClient -> String -> [String] -> STM ()
-dbCommit server@Server{..} LocalClient{..} txnId str = do
+dbCommit :: Server -> LocalClient -> String -> [String] -> CName -> STM ()
+dbCommit server@Server{..} LocalClient{..} txnId str cname = do
   let l = map ((\[x, y, z] -> (x, y, read z :: Int)) . splitOn "#") str
       l' = List.groupBy (\(x, _, _) (y, _, _) -> x == y) l
-      -- map (\x -> (fst (head x), (KVRequest spid txnId x))) l'
-      l'' = []
+      l'' = map (\x -> (sel1 (head x), KVRequest spid txnId x)) l'
   vMap <- readTVar txnVotes
-  writeTVar txnVotes $ Map.insert txnId (length l'') vMap
-  foldl (\x (k, pmsg) -> x >> dbSend server k pmsg) (return ()) l''
+  cnt <- foldl (\x (k, pmsg) -> do c <- x; dbSend server k pmsg; return (c + 1)) (return 0) l''
+  writeTVar txnVotes $ Map.insert txnId (cnt, Set.empty, TXN_UNDECIDED, cname) vMap
 
-dbAccept :: Server -> LocalClient -> String -> [String] -> STM Bool
-dbAccept server@Server{..} LocalClient{..} txnId l = undefined
+dbVote :: Server -> ProcessId -> TxnId -> [(KVKey, KVVal, KVVersion)] -> STM ()
+dbVote server@Server{..} pid txnId options = do
+  recs <- readTVar txns
+  unless (Map.member txnId recs) $
+    writeTVar txns (Map.insert txnId (TXN_UNDECIDED, False, []) recs)
+  r <- foldl (\b (key, val, ver) -> do
+    res <- b
+    if not res then return False
+    else do
+      records <- readTVar txns
+      case Map.lookup txnId records of
+        Just (stat, dirty, l) -> do
+          db <- readTVar mmdb
+          case Map.lookup key db of
+            Just (val', ver') ->
+              if ver' > ver then do sendAbort; return False
+              else do -- update the verion upon accept
+                writeTVar mmdb (Map.insert key (val', ver+1) db)
+                writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
+            Nothing -> do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
+        _ -> error "dVote should not reach here" >> return False
+    ) (return True) options
+  when r sendReady; return ()
+  where sendAbort = sendRemote server pid $ KVResponse spid txnId VoteAbort
+        sendReady = sendRemote server pid $ KVResponse spid txnId VoteReady
 
-dbDecide :: Server -> LocalClient -> String -> [String] -> STM Bool
-dbDecide server@Server{..} LocalClient{..} txnId str = undefined
+dbAccept :: Server -> ProcessId -> TxnId -> KVVote -> STM ()
+dbAccept server@Server{..} apid txnId vote = do
+  vMap <- readTVar txnVotes
+  case Map.lookup txnId vMap of
+    Just (c, ps, TXN_UNDECIDED, cname) ->
+      if vote == VoteReady then
+        if c - 1 == 0 then do -- commit now!
+          writeTVar txnVotes $ Map.insert txnId (c - 1, Set.insert apid ps, TXN_COMMITTED, cname) vMap
+          let pmsg = KVResult spid txnId DecisionCommit
+          mapM_ (\pid -> sendRemote server pid pmsg) (Set.insert apid ps)
+        else writeTVar txnVotes $ Map.insert txnId (c - 1, Set.insert apid ps, TXN_UNDECIDED, cname) vMap
+      else do -- abourt now!
+        writeTVar txnVotes $ Map.insert txnId (c - 1, Set.insert apid ps, TXN_ABORTED, cname) vMap
+        let pmsg = KVResult spid txnId DecisionAbort
+        mapM_ (\pid -> sendRemote server pid pmsg) (Set.insert apid ps)
+    _ -> error "dbAccept should not reach here" >> return ()
+
+dbDecide :: Server -> ProcessId -> TxnId -> KVDecision -> STM ()
+dbDecide server@Server{..} pid txnId decision = do
+  records <- readTVar txns
+  case Map.lookup txnId records of
+    Just (TXN_UNDECIDED, dirty, options) -> do
+      if decision == DecisionCommit then do
+        foldl (\b (key, val, ver) -> do
+            b; db <- readTVar mmdb; writeTVar mmdb (Map.insert key (val, ver) db)
+          ) (return ()) options
+        writeTVar txns (Map.insert txnId (TXN_COMMITTED, dirty, options) records)
+      else writeTVar txns (Map.insert txnId (TXN_ABORTED, dirty, options) records)
+      sendRemote server pid $ KVACK spid txnId
+    _ -> error "dbDecide should not reach here" >> return ()
+
+
+dbDone :: Server -> ProcessId -> TxnId -> STM ()
+dbDone server@Server{..} pid txnId = do
+  vMap <- readTVar txnVotes
+  case Map.lookup txnId vMap of
+    Just (c, ps, stat, cname) -> do
+      let new_ps = Set.delete pid ps
+      writeTVar txnVotes $ Map.insert txnId (c, new_ps, stat, cname) vMap
+      when (Set.null new_ps) $
+        if stat == TXN_COMMITTED then void $ sendToName server cname (DB "OK")
+        else void $ sendToName server cname (DB "ABORT")
+    _ -> error "dbDone should not reach here" >> return ()
+
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -354,10 +433,11 @@ handleMessage server@Server{..} client@LocalClient{..} message =
             atomically $ dbWeakGet server client key; return True
         "/set" : key : value -> do
             atomically $ dbWeakSet server client key (unwords value); return True
-        ["/read", txnId, key] -> do
-            atomically $ dbRead server client txnId key; return True
+        ["/read", key] -> do
+            atomically $ dbRead server client key; return True
         "/commit" : txnId : str -> do
-            atomically $ dbCommit server client txnId str; return True
+            putStrLn $ "Receve a transaction: " ++ txnId
+            atomically $ dbCommit server client txnId str localName; return True
         ('/':_):_ -> do
             hPutStrLn clientHandle $ "Unrecognised command: " ++ msg; return True
         _ -> do
@@ -378,7 +458,7 @@ handleRemoteMessage server@Server{..} m =
     MsgServerInfo rsvp rid pid cs -> newServerInfo server rsvp rid pid cs
     MsgBroadcast msg -> liftIO $ atomically $ broadcastLocal server msg
     MsgSend name msg -> liftIO $ atomically $ void $ sendToName server name msg
-    MsgKick _ _   -> undefined
+    MsgKick who by   -> liftIO $ atomically $ kick server who by
     MsgNewClient name pid -> liftIO $ atomically $ do
         ok <- checkAddClient server (ClientRemote (RemoteClient name pid))
         unless ok $ sendRemote server pid (MsgKick name "SYSTEM")
@@ -404,8 +484,23 @@ handleRemoteMessage server@Server{..} m =
     -- Receive a set request
     SetRequest k v cn -> liftIO $ atomically $ dbstoreSet server k v cn
     -- REceive a get reqeust
-    GetRequest k cn -> liftIO $ atomically $ dbstoreGet server k cn
-    _ -> undefined
+    GetRequest k cn b -> liftIO $ atomically $ dbstoreGet server k cn b
+    KVRequest pid txnId options -> liftIO $ do
+      putStrLn (txnId ++ ": Receive KVRequest from " ++ show pid)
+      atomically $ dbVote server pid txnId options
+    KVResponse pid txnId vote -> liftIO $ do
+      putStrLn (txnId ++ ": Receive KVResponse from " ++ show pid)
+      atomically $ dbAccept server pid txnId vote
+    KVResult pid txnId decision -> liftIO $ do
+      putStrLn (txnId ++ ": Receive KVResult from " ++ show pid)
+      records <- atomically $ readTVar txns
+      case Map.lookup txnId records of
+        Just (x, y, z) -> do putStrLn (show x); putStrLn (show y); putStrLn (show z)
+        _ -> return ()
+      atomically $ dbDecide server pid txnId decision
+    KVACK pid txnId -> liftIO $ do
+      putStrLn (txnId ++ ": Receive KVACK from " ++ show pid)
+      atomically $ dbDone server pid txnId
 
 -- Handle the join request by sending my self server information
 handleWhereIsReply :: Server -> WhereIsReply -> Process ()
@@ -431,7 +526,7 @@ checkAddClient server@Server{..} client = do
     let name = clientName client
     if Map.member name clientmap then return False
     else do writeTVar clients (Map.insert name client clientmap)
-            broadcastLocal server $ Notice $ name ++ " has connected"
+            when (name /= "AppServer") (broadcastLocal server $ Notice $ name ++ " has connected")
             return True
 
 --

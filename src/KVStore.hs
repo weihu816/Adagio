@@ -11,16 +11,21 @@ module KVStore
   , CName
   , RId
   , ID
+  , TxnId
+  , KVVersion
   , newLocalClient
   , clientName
   , Message(..)
   , PMessage(..)
   , TxnStatue(..)
+  , KVVote(..)
+  , KVDecision(..)
   ) where
 
 import Data.Binary
 import GHC.Generics (Generic)
 import Data.Map (Map)
+import Data.Set (Set)
 import Control.Concurrent.STM
 import System.IO
 import Control.Distributed.Process
@@ -37,7 +42,17 @@ type TxnId = String
 type KVVersion = Int
  
 
-data TxnStatue = TXN_UNDECIDED | TXN_COMMITED | TXN_ABORTED
+data TxnStatue = TXN_UNDECIDED | TXN_COMMITTED | TXN_ABORTED
+  deriving (Generic, Show, Eq)
+instance Binary TxnStatue
+
+data KVVote = VoteReady | VoteAbort
+  deriving (Generic, Show, Eq)
+instance Binary KVVote
+
+data KVDecision = DecisionCommit | DecisionAbort
+  deriving (Generic, Show, Eq)
+instance Binary KVDecision
 
 -- Server
 data Server = Server {
@@ -52,9 +67,9 @@ data Server = Server {
   counter   :: TVar (Int, Int),                     -- largest sequence number proposed and observed
   votes     :: TVar (Map ID (Int, Int)),            -- Sender: uuid => (remain count, max)
   messages  :: TVar (Map ID (Bool, Int, ProcessId, String, CName)), -- Receiver: uuid => (flag, pval, pid, msg)
-  mmdb      :: TVar (Map KVKey KVVal),                -- In memory database
+  mmdb      :: TVar (Map KVKey (KVVal, KVVersion)),                 -- In memory database
   txns      :: TVar (Map TxnId (TxnStatue, Bool, [(KVKey, KVVal, KVVersion)])),  -- isDirty
-  txnVotes  :: TVar (Map ID Int)
+  txnVotes  :: TVar (Map TxnId (Int, Set ProcessId, TxnStatue, CName))
 }
 
 -- Client
@@ -101,7 +116,6 @@ instance Binary Message
 -- PMessage
 data PMessage
   = MsgServerInfo         Bool RId ProcessId [CName]
-  | MsgAppServer          ProcessId
   | MsgSend               CName Message
   | MsgBroadcast          Message
   | MsgKick               CName CName
@@ -111,10 +125,15 @@ data PMessage
   | MulticastPropose      ProcessId Int ID -- pid propose uuid
   | MulticastDeciscion    ProcessId Int ID -- pid propose uuid
   | SetRequest            KVKey KVVal CName
-  | GetRequest            KVKey CName
-  | GetResponse           KVKey (Maybe KVVal) 
+  | GetRequest            KVKey CName Bool
   | KVRequest             ProcessId TxnId [(KVKey, KVVal, KVVersion)]
-  | KVResponse            ProcessId TxnId
+  | KVResponse            ProcessId TxnId KVVote
+  | KVResult              ProcessId TxnId KVDecision
+  | KVACK                 ProcessId TxnId
   deriving (Typeable, Generic)
 instance Binary PMessage
+
+-- The following are not used any more
+-- | GetResponse           KVKey (Maybe KVVal) 
+-- | MsgAppServer          ProcessId
 
