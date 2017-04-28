@@ -349,12 +349,12 @@ dbVote server@Server{..} pid txnId options = do
         Just (stat, dirty, l) -> do
           db <- readTVar mmdb
           case Map.lookup key db of
-            Just (_, ver') ->
+            Just (val', ver') ->
               if (ver' > ver) then do sendAbort; return False
-              else do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
-              --  else do -- writeTVar mmdb (Map.insert key (val', ver+1) db)
-              --  writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
-            Nothing -> do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
+              else do
+                writeTVar mmdb (Map.insert key (val', ver+1) db)
+                writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver+1):l) records); return True
+            Nothing -> do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver+1):l) records); return True
         _ -> error "dVote should not reach here" >> return False
     ) (return True) options
   when r sendReady; return ()
@@ -388,8 +388,8 @@ dbDecide server@Server{..} pid txnId decision = do
             db <- readTVar mmdb
             case Map.lookup key db of
               Just (_, ver') ->
-                when (ver >= ver') $ writeTVar mmdb (Map.insert key (val, ver+1) db)
-              _ -> writeTVar mmdb (Map.insert key (val, ver+1) db)
+                when (ver >= ver') $ writeTVar mmdb (Map.insert key (val, ver) db)
+              _ -> writeTVar mmdb (Map.insert key (val, ver) db)
           ) (return ()) options
         writeTVar txns (Map.insert txnId (TXN_COMMITTED, dirty, options) records)
       else writeTVar txns (Map.insert txnId (TXN_ABORTED, dirty, options) records)
@@ -597,7 +597,9 @@ updateFtable = undefined
 deleteClient :: Server -> CName -> STM ()
 deleteClient server@Server{..} name = do
     modifyTVar' clients $ Map.delete name
-    broadcastLocal server $ Notice $ name ++ " has disconnected"
+    case name of 
+      '/':_  -> return ()
+      _ -> broadcastLocal server $ Notice $ name ++ " has disconnected"
 
 
 -- register remotable (using distributed-process framework)

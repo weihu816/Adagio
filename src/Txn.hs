@@ -53,7 +53,7 @@ readTxn txn@TxnManager{..} key = do
       case res of
         Just (val, ver) -> do atomically $ updateRSet txn key val ver
                               return (Just val)
-        _  -> error ("readTxn " ++ key) >> return Nothing
+        x  -> error ("readTxn " ++ key ++ " " ++ (show x)) >> return Nothing
 
 writeTxn :: TxnManager -> KVKey -> KVVal -> IO ()
 writeTxn txn@TxnManager{..} key val = do
