@@ -36,6 +36,7 @@ library
                        , split
                        , tuple
                        , mtl
+                       , random
   default-language:    Haskell2010
 
 executable node

@@ -4,6 +4,7 @@ import qualified Data.UUID as U       -- UUID
 import qualified Data.UUID.V4 as U4   -- UUID
 import Data.Word
 import Data.List.Split
+import Control.Concurrent
 import Data.Time
 import System.Socket
 import System.Socket.Family.Inet
@@ -14,6 +15,9 @@ genUUID :: IO String
 genUUID = do
     x <- U4.nextRandom
     return $ U.toString x
+
+atomicPutStrLn :: MVar () -> String -> IO ()
+atomicPutStrLn lock str = withMVar lock (\_ -> putStrLn str)
 
 -- | Check whether a string starts with a certain prefix
 startsWith' :: String -> String -> Bool

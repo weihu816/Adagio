@@ -317,7 +317,7 @@ dbstoreSet :: Server -> KVKey -> KVVal -> CName -> STM ()
 dbstoreSet server@Server{..} k v name = do
   db <- readTVar mmdb
   case Map.lookup k db of
-    Nothing -> writeTVar mmdb $ Map.insert k (v, 0) db
+    Nothing -> writeTVar mmdb $ Map.insert k (v, 1) db
     Just (_, ver) -> writeTVar mmdb $ Map.insert k (v, ver) db
   void $ sendToName server name $ DB v
 
@@ -349,11 +349,11 @@ dbVote server@Server{..} pid txnId options = do
         Just (stat, dirty, l) -> do
           db <- readTVar mmdb
           case Map.lookup key db of
-            Just (val', ver') ->
-              if ver' > ver then do sendAbort; return False
-              else do -- update the verion upon accept
-                writeTVar mmdb (Map.insert key (val', ver+1) db)
-                writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
+            Just (_, ver') ->
+              if (ver' > ver) then do sendAbort; return False
+              else do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
+              --  else do -- writeTVar mmdb (Map.insert key (val', ver+1) db)
+              --  writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
             Nothing -> do writeTVar txns (Map.insert txnId (stat, dirty, (key, val, ver):l) records); return True
         _ -> error "dVote should not reach here" >> return False
     ) (return True) options
@@ -384,8 +384,12 @@ dbDecide server@Server{..} pid txnId decision = do
   case Map.lookup txnId records of
     Just (TXN_UNDECIDED, dirty, options) -> do
       if decision == DecisionCommit then do
-        foldl (\b (key, val, ver) -> do
-            b; db <- readTVar mmdb; writeTVar mmdb (Map.insert key (val, ver) db)
+        foldl (\b (key, val, ver) -> b >> do
+            db <- readTVar mmdb
+            case Map.lookup key db of
+              Just (_, ver') ->
+                when (ver >= ver') $ writeTVar mmdb (Map.insert key (val, ver+1) db)
+              _ -> writeTVar mmdb (Map.insert key (val, ver+1) db)
           ) (return ()) options
         writeTVar txns (Map.insert txnId (TXN_COMMITTED, dirty, options) records)
       else writeTVar txns (Map.insert txnId (TXN_ABORTED, dirty, options) records)
@@ -495,7 +499,7 @@ handleRemoteMessage server@Server{..} m =
       putStrLn (txnId ++ ": Receive KVResult from " ++ show pid)
       records <- atomically $ readTVar txns
       case Map.lookup txnId records of
-        Just (x, y, z) -> do putStrLn (show x); putStrLn (show y); putStrLn (show z)
+        Just (x, _, z) -> do putStrLn (show x); putStrLn (show z)
         _ -> return ()
       atomically $ dbDecide server pid txnId decision
     KVACK pid txnId -> liftIO $ do

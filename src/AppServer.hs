@@ -25,10 +25,12 @@ doRead key = do
     hPutStrLn hdl clientname
     hPutStrLn hdl $ "/read " ++ key
     str <- hGetLine hdl
-    putStrLn $ "[DEBUG] doRead: " ++ key ++ " -> " ++ str
+    -- putStrLn $ "[DEBUG] doRead: " ++ key ++ " -> " ++ str
     hClose hdl
     case words str of
-        [val, ver] -> return $ Just (val, read ver :: Int)
+        [val, ver] -> 
+            if ver == "0" then return Nothing
+            else return $ Just (val, read ver :: Int)
         _ -> return Nothing
 
 
@@ -43,7 +45,7 @@ doCommit txnId l = do
     hPutStrLn hdl $ "/commit " ++ txnId ++ " " ++ s
     str <- hGetLine hdl
     hClose hdl
-    putStrLn $ "[DEBUG] doCommit: " ++ txnId ++ " " ++ str
+    -- putStrLn $ "[DEBUG] doCommit: " ++ txnId ++ " " ++ str
     case words str of
         ["OK"] -> return True
         _ -> return False

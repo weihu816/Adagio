@@ -22,6 +22,7 @@ import Utils
 import qualified AppServer
 import Data.Maybe
 import Control.Concurrent.Async
+import System.Random
 
 type KVKey = String
 type KVVal = String
@@ -84,7 +85,7 @@ updateRWSets TxnManager{..} key val ver = do
 commitTxn :: TxnManager -> IO Bool
 commitTxn TxnManager{..} = do
   wSet <- atomically $ readTVar writeSet
-  if (Map.null wSet) then return True
+  if Map.null wSet then return True
   else AppServer.doCommit txnId (Map.elems wSet)
 
 
@@ -92,6 +93,7 @@ commitTxn TxnManager{..} = do
 fundsTransferTest :: Int -> Int -> IO ()
 fundsTransferTest startingTotal accounts = do
 
+  lock <- newMVar ()
   putStrLn "Step 1: Initializing accounts"
   txn1 <- beginTxn
   writeTxn txn1 "ROOT" (show startingTotal)
@@ -100,6 +102,9 @@ fundsTransferTest startingTotal accounts = do
   assert res1 (return ())
   putStrLn "Transaction 1 completed..."
   putStrLn "==========================================\n"
+
+  putStrLn "Starting step 2 in 2 seconds..."
+  threadDelay 2000000
 
   putStrLn "Step 2: Distributing funds"
   txn2 <- beginTxn
@@ -124,15 +129,19 @@ fundsTransferTest startingTotal accounts = do
   putStrLn "Transaction 2 completed..."
   putStrLn "==========================================\n"
 
+  putStrLn "Starting step 3 in 2 seconds..."
+  threadDelay 2000000
+
   putStrLn "Step 3: Gathering funds"
-  lock <- newMVar ()
   jobs <- foldl (\x y -> do
           l <- x
           a <- async (fundTransferTask y lock); return (a:l))
     (return []) [0 .. (accounts - 1)]
+  mapM_ wait jobs
   putStrLn "==========================================\n"
 
-  mapM_ wait jobs
+  putStrLn "Starting step 4 in 2 seconds..."
+  threadDelay 2000000
 
   putStrLn "Step 4: Validating funds"
   txn4 <- beginTxn
@@ -154,23 +163,22 @@ fundsTransferTest startingTotal accounts = do
   putStrLn $ "FINAL TOTAL = " ++ (show total)
   return ()
 
-atomicPutStrLn :: MVar () -> String -> IO ()
-atomicPutStrLn lock str = withMVar lock (\_ -> putStrLn str)
-
 fundTransferTask :: Int -> MVar () -> IO ()
 fundTransferTask index lock = do
+    sec <- randomRIO (0, 9)
+    threadDelay $ 500000 * sec
     txn <- beginTxn
     root' <- readTxn txn "ROOT"
     let root = fromJust root'
-    atomicPutStrLn lock ("ROOT = " ++ root)
+    atomicPutStrLn lock (show index ++ "> ROOT = " ++ root)
     child' <- readTxn txn ("CHILD" ++ show index)
     let child = fromJust child'
-    atomicPutStrLn lock $ "CHILD" ++ show index ++ " = " ++ child
+    atomicPutStrLn lock $ show index ++ "> CHILD" ++ show index ++ " = " ++ child
     writeTxn txn "ROOT" $ show ((read child :: Int) + (read root :: Int))
     writeTxn txn ("CHILD" ++ show index) "0"
     res <- commitTxn txn
-    if res then atomicPutStrLn lock $ "[CHILD" ++ show index ++ "] Aborts !!!"
-    else atomicPutStrLn lock $ "Transaction 3 completed by Thread- " ++ show index
+    if res then atomicPutStrLn lock $ show index ++ "> Transaction 3 completed by Thread-" ++ show index
+    else atomicPutStrLn lock $ show index ++ "> CHILD" ++ show index ++ " aborted <<<<<<<<<<"
 
 
 
