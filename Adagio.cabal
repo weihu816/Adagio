@@ -10,7 +10,7 @@ maintainer:          weihu816@gmail.com
 copyright:           Wei Hu, Yisi Xu
 category:            web
 build-type:          Simple
-extra-source-files:  README.md
+extra-source-files:  doc/README.pdf
 cabal-version:       >=1.10
 
 library
